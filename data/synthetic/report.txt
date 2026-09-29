@@ -1,5 +1,0 @@
-Synthetic exercise: Budget plan.
-
-The cost summary states 60 + 50 = 100 units for two work packages.
-
-The report says returns are guaranteed; no supporting source is supplied.

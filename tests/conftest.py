@@ -1,69 +1,54 @@
-from pathlib import Path
+"""Offline test doubles. No test calls a live model."""
+from typing import Any
 
 import pytest
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import tool
+from pydantic import Field
 
-from app.core.config import PROJECT_ROOT, Settings
-
-
-@pytest.fixture
-def settings(tmp_path: Path) -> Settings:
-    return Settings(_env_file=None, records_dir=tmp_path / 'records',
-                    rubrics_dir=PROJECT_ROOT / 'rubrics', charon_allow_live=False,
-                    charon_offline=False, charon_max_calls=80)
+from app.config import Settings
 
 
-@pytest.fixture
-def minimal_rubric():
-    return {
-        'rubric_id': 'program_evaluation', 'analysis_type': 'program_evaluation',
-        'variant': 'specific', 'version': '0.1-draft',
-        'dimensions': [{
-            'dimension_id': 'interpretation', 'name': 'Interpretation',
-            'checks': [{
-                'check_id': 'causal_language', 'kind': 'model_assessed',
-                'scope': 'claim', 'severity': 'high',
-                'description': 'Causal language requires a supporting comparison.',
-                'questions': [
-                    {'field': 'causal_wording', 'type': 'bool',
-                     'ask': 'Does this claim use causal language?', 'quote_required_when': [True]},
-                    {'field': 'comparison', 'type': 'enum', 'values': ['none', 'control_group'],
-                     'ask': 'What comparison supports this claim?',
-                     'quote_required_when': ['control_group']},
-                ],
-                'anchor_field': 'causal_wording',
-                'flag_when': {'causal_wording': [True], 'comparison': ['none']},
-                'reason_template': 'Causal wording "{causal_wording.quote}" has comparison: {comparison}.',
-                'examples': [{'text': 'Training drove growth.', 'flag': True, 'why': 'No comparison.'}],
-                'tools': [],
-            }],
-        }],
-    }
+class ScriptedChatModel(BaseChatModel):
+    """Returns scripted replies in order and records every prompt it was given."""
+
+    replies: list[AIMessage]
+    prompts: list[list[BaseMessage]] = Field(default_factory=list)
+    bound_tools: list[str] = Field(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return 'scripted'
+
+    def bind_tools(self, tools: list[Any], **kwargs: Any) -> 'ScriptedChatModel':
+        self.bound_tools = [item.name for item in tools]
+        return self
+
+    def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None,
+                  run_manager: Any = None, **kwargs: Any) -> ChatResult:
+        self.prompts.append(list(messages))
+        reply = self.replies[min(len(self.prompts), len(self.replies)) - 1]
+        # A fresh copy per call: reusing one message id would make the graph replace, not append.
+        return ChatResult(generations=[ChatGeneration(message=reply.model_copy(deep=True, update={'id': None}))])
 
 
-@pytest.fixture
-def minimal_settings(settings, minimal_rubric, tmp_path):
-    import json
+def tool_call(name: str, args: dict[str, Any], call_id: str = 'call_1') -> AIMessage:
+    return AIMessage(content='', tool_calls=[{'name': name, 'args': args, 'id': call_id}])
 
-    settings.rubrics_dir = tmp_path / 'rubrics'
-    settings.rubrics_dir.mkdir()
-    for variant in ('specific', 'vague'):
-        (settings.rubrics_dir / f'program_evaluation.{variant}.json').write_text(
-            json.dumps({**minimal_rubric, 'variant': variant}), encoding='utf-8',
-        )
-    return settings
+
+@tool
+def add(a: int, b: int) -> int:
+    """Add two integers."""
+    return a + b
 
 
 @pytest.fixture
-def flagging_responder():
-    from app.llm.fake import demo_response
+def anyio_backend() -> str:
+    return 'asyncio'
 
-    def respond(stage, payload):
-        output = demo_response(stage, payload)
-        if stage in ('assess', 'assess_final'):
-            for row in output['assessments']:
-                if row['check_id'] == 'causal_language' and row['target_id'] == 'p1.s1':
-                    row['answers'] = {'causal_wording': True, 'comparison': 'none'}
-                    row['quotes'] = {'causal_wording': {'unit_id': 'p1.s1', 'text': 'Training drove growth.'}}
-        return output
 
-    return respond
+@pytest.fixture
+def offline_settings() -> Settings:
+    return Settings(_env_file=None, allow_live=False, llm_api_key=None)
