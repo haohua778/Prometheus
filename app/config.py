@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = Field(default=60, gt=0, le=300,
                                        validation_alias=AliasChoices('LLM_TIMEOUT_SECONDS'))
     # Graph steps per chat turn; each model call and each tool round is one step.
-    max_steps: int = Field(default=20, ge=3, le=50, validation_alias=AliasChoices('CHARON_MAX_STEPS'))
+    max_steps: int = Field(default=20, ge=3, le=50, validation_alias=AliasChoices('PROMETHEUS_MAX_STEPS'))
 
 
 @lru_cache(maxsize=1)

@@ -38,13 +38,24 @@
 
 **后果**：每轮最多多 3 次模型调用；审查和修改也占用图步数，计入 `CHARON_MAX_STEPS`。原默认值 12 在最坏情况（3 次回答前各调一次工具）下会超限，因此默认值改为 20（取代 ADR-003 中的 12）。
 
-## 下一步
-
-- 记忆：`build_graph` 已接受 `checkpointer`（线程内记忆）和 `store`（跨线程长期记忆），测试已验证 `InMemorySaver` 能按 thread_id 保留历史。接入时要在进程内共享一个 checkpointer，而不是每个请求新建。
-- 工具：按客户真实任务逐个加入 `app/agent/tools/`。
-
 ## ADR-005 聊天直接使用配置的模型（2026-10-01）
 
 **背景**：ADR-003 的 `CHARON_ALLOW_LIVE=false` 让填好密钥的 Agent 仍默认拒绝聊天，也容易被误解为模型故障后的兜底机制。
 
 **决定**：废止 ADR-003 中默认关闭真实模型调用的开关，移除 `CHARON_ALLOW_LIVE` 和 `live_calls_disabled`。`/chat` 有密钥就使用配置的模型；密钥缺失或空白时返回 503 `missing_api_key`。真实调用失败时继续明确返回上游错误，不切换到假模型。测试继续使用脚本化假模型，不发起真实请求。图步数上限仍保留，默认值沿用 ADR-004 的 20。
+
+## ADR-006 改名为 Prometheus，迁到新公开仓库（2026-10-02）
+
+**背景**：本地目录改名为 `Prometheus_agent`，项目随之改名，并单独发布一个公开仓库。
+
+**决定**
+- 代码、提示词、README 和 `pyproject.toml` 里的项目名从 Charon 改为 Prometheus。步数上限的环境变量从 `CHARON_MAX_STEPS` 改为 `PROMETHEUS_MAX_STEPS`，旧名不再读取。之前各条 ADR 里的旧名保持原样，以本条为准。
+- 主线推送到新的公开仓库 `haohua778/Prometheus`（本地 remote `prometheus`，`main` 跟踪它）。
+- 更正 ADR-001：`haohua778/Charon` 现在是公开仓库，不是私有。存档分支 `archive/review-pipeline` 和标签 `review-pipeline-v0.1` 只在该仓库（本地 remote `origin`）里。
+
+**后果**：已有 `.env` 里的 `CHARON_MAX_STEPS` 要改名，否则回到默认值 20。存档分支和标签都指向 `0d98553`，它是 `main` 的第一个提交，所以 v0.1 代码也在 Prometheus 的历史里；新 clone 的仓库可以用 `git checkout 0d98553 -- app/segment.py` 取回旧模块。
+
+## 下一步
+
+- 记忆：`build_graph` 已接受 `checkpointer`（线程内记忆）和 `store`（跨线程长期记忆），测试已验证 `InMemorySaver` 能按 thread_id 保留历史。接入时要在进程内共享一个 checkpointer，而不是每个请求新建。
+- 工具：按客户真实任务逐个加入 `app/agent/tools/`。

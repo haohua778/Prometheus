@@ -1,4 +1,4 @@
-"""Charon's agent loop: the model answers or calls tools, and tool results go back to the model.
+"""Prometheus's agent loop: the model answers or calls tools, and tool results go back to the model.
 
 Before a final answer is returned, the model reviews it and may send it back for revision.
 """

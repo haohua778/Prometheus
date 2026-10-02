@@ -14,7 +14,7 @@ from app.agent.tools import TOOLS
 from app.config import Settings, get_settings
 from app.llm import MissingAPIKeyError, build_chat_model
 
-app = FastAPI(title='Charon')
+app = FastAPI(title='Prometheus')
 
 
 class ChatRequest(BaseModel):
