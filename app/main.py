@@ -45,12 +45,14 @@ async def chat(request: ChatRequest,
                settings: Annotated[Settings, Depends(get_settings)]) -> ChatResponse:
     thread_id = request.thread_id or uuid4().hex
     config = {'configurable': {'thread_id': thread_id}, 'recursion_limit': settings.max_steps}
+    # Each turn starts a fresh review cycle; with a checkpointer these would otherwise carry over.
+    turn = {'messages': [HumanMessage(request.message)], 'iteration': 0, 'review': None, 'decision': None}
     try:
-        state = await agent.ainvoke({'messages': [HumanMessage(request.message)]}, config=config)
+        state = await agent.ainvoke(turn, config=config)
     except GraphRecursionError as exc:
         raise HTTPException(status_code=500, detail={'code': 'step_limit_reached'}) from exc
     except APITimeoutError as exc:
         raise HTTPException(status_code=504, detail={'code': 'upstream_timeout'}) from exc
     except APIError as exc:
         raise HTTPException(status_code=502, detail={'code': 'upstream_error'}) from exc
-    return ChatResponse(thread_id=thread_id, reply=str(state['messages'][-1].text))
+    return ChatResponse(thread_id=thread_id, reply=state['answer'])

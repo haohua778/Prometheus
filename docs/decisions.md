@@ -25,6 +25,19 @@
 
 **决定**：`CHARON_ALLOW_LIVE` 默认 false，此时 `/chat` 返回 503 `live_calls_disabled`。测试全部用离线假模型。每轮对话的图步数上限 `CHARON_MAX_STEPS`（默认 12），防止工具调用死循环。
 
+## ADR-004 反思：最终回答先经模型审查（2026-10-01）
+
+**背景**：agent 的最终回答直接返回给分析师，格式、工具调用和结果是否自洽都没有检查。
+
+**决定**
+- agent 不再调工具时，回答先进入 `reflect` 节点，由同一个模型（不绑定工具）审查。审查看完整对话（XML 格式，含工具调用和结果），只检查三点：输出格式、工具调用、结果是否合理。
+- 结论用文本给出：第一行 `PASS` 或 `REVISE`，`REVISE` 后逐条写问题和改法。只有明确的 `REVISE` 才退回，其余都放行（fail-open）。
+- 退回时审查意见只加进 agent 这一次的提示，不写入消息历史；草稿回答仍保留在消息历史中。
+- 每轮最多审查 `MAX_ITERATIONS = 3` 次（最多修改 2 次），第 3 次后不论结论都返回当前回答。
+- 图的状态从 `MessagesState` 换成 `AgentState`，在 `messages` 之外加 `answer`（当前回答）、`review`（审查意见）、`decision`（`continue`/`stop`）、`iteration`（本轮已审查次数）。`/chat` 返回 `answer`。`/chat` 每轮的输入都把 `iteration`、`review`、`decision` 重置为 0 / None，接入 checkpointer 后也不会沿用上一轮的审查状态。
+
+**后果**：每轮最多多 3 次模型调用；审查和修改也占用图步数，计入 `CHARON_MAX_STEPS`。原默认值 12 在最坏情况（3 次回答前各调一次工具）下会超限，因此默认值改为 20（取代 ADR-003 中的 12）。
+
 ## 下一步
 
 - 记忆：`build_graph` 已接受 `checkpointer`（线程内记忆）和 `store`（跨线程长期记忆），测试已验证 `InMemorySaver` 能按 thread_id 保留历史。接入时要在进程内共享一个 checkpointer，而不是每个请求新建。

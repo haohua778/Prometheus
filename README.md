@@ -16,14 +16,14 @@ app/
   llm.py               唯一构造聊天模型的地方（langchain-openai，OpenAI 兼容接口）
   agent/
     graph.py           build_graph(model, tools, checkpointer=None, store=None)
-    prompts.py         系统提示
+    prompts.py         系统提示、审查提示、修改提示
     tools/__init__.py  工具注册表 TOOLS
   main.py              FastAPI：GET /health，POST /chat
 tests/                 离线测试，用脚本化假模型
 docs/decisions.md      决策记录
 ```
 
-图的结构：`START → agent`；agent 要调工具就进 `tools`，执行完回到 `agent`；不调工具就结束。没有工具时只有 `agent` 一个节点。
+图的结构：`START → agent`；agent 要调工具就进 `tools`，执行完回到 `agent`；不调工具时，最终回答进入 `reflect`，由模型审查输出格式、工具调用和结果是否合理。审查结论是 `REVISE` 就把意见交回 `agent` 修改，否则结束。每轮最多审查 3 次，之后直接返回当前回答。没有工具时只有 `agent` 和 `reflect` 两个节点。
 
 ## 运行
 
