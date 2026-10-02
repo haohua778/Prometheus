@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from app.agent.graph import build_graph
 from app.agent.tools import TOOLS
 from app.config import Settings, get_settings
-from app.llm import ModelUnavailable, build_chat_model
+from app.llm import MissingAPIKeyError, build_chat_model
 
 app = FastAPI(title='Charon')
 
@@ -30,8 +30,8 @@ class ChatResponse(BaseModel):
 def get_agent(settings: Annotated[Settings, Depends(get_settings)]) -> CompiledStateGraph:
     try:
         return build_graph(build_chat_model(settings), TOOLS)
-    except ModelUnavailable as exc:
-        raise HTTPException(status_code=503, detail={'code': exc.code}) from exc
+    except MissingAPIKeyError as exc:
+        raise HTTPException(status_code=503, detail={'code': 'missing_api_key'}) from exc
 
 
 @app.get('/health')

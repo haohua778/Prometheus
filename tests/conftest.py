@@ -51,4 +51,4 @@ def anyio_backend() -> str:
 
 @pytest.fixture
 def offline_settings() -> Settings:
-    return Settings(_env_file=None, allow_live=False, llm_api_key=None)
+    return Settings(_env_file=None, llm_api_key=None)

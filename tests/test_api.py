@@ -5,6 +5,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.graph import MAX_ITERATIONS, build_graph
 from app.config import Settings, get_settings
+from app.llm import build_chat_model
 from app.main import app, get_agent
 from tests.conftest import ScriptedChatModel, add, tool_call
 
@@ -64,20 +65,23 @@ def test_invalid_requests_are_rejected(client, payload):
     assert client.post('/chat', json=payload).status_code == 422
 
 
-def test_live_calls_are_off_by_default(client):
-    response = client.post('/chat', json={'message': 'hi'})
-    assert response.status_code == 503
-    assert response.json()['detail'] == {'code': 'live_calls_disabled'}
-
-
-def test_live_calls_need_an_api_key():
-    app.dependency_overrides[get_settings] = lambda: Settings(_env_file=None, allow_live=True, llm_api_key='  ')
+@pytest.mark.parametrize('api_key', [None, '  '])
+def test_chat_needs_an_api_key(api_key):
+    app.dependency_overrides[get_settings] = lambda: Settings(_env_file=None, llm_api_key=api_key)
     try:
         response = TestClient(app).post('/chat', json={'message': 'hi'})
     finally:
         app.dependency_overrides.clear()
     assert response.status_code == 503
     assert response.json()['detail'] == {'code': 'missing_api_key'}
+
+
+def test_model_can_be_built_with_a_key_without_an_extra_switch():
+    settings = Settings(_env_file=None, llm_api_key='test-key', llm_base_url='https://example.invalid/v1')
+
+    model = build_chat_model(settings)
+
+    assert model.model_name == settings.llm_model
 
 
 def test_step_limit_returns_a_clear_error(offline_settings):

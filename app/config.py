@@ -1,4 +1,4 @@
-"""Runtime settings. Live model calls stay off until explicitly enabled."""
+"""Runtime settings for the LLM-backed agent."""
 from functools import lru_cache
 from pathlib import Path
 
@@ -12,7 +12,6 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=PROJECT_ROOT / '.env', env_file_encoding='utf-8',
                                       extra='ignore', populate_by_name=True)
 
-    allow_live: bool = Field(default=False, validation_alias=AliasChoices('CHARON_ALLOW_LIVE'))
     # Any OpenAI-compatible endpoint. The older KIMI_* names are still read.
     llm_api_key: SecretStr | None = Field(default=None, validation_alias=AliasChoices('LLM_API_KEY', 'KIMI_API_KEY'))
     llm_base_url: str | None = Field(default=None, validation_alias=AliasChoices('LLM_BASE_URL', 'KIMI_BASE_URL'))

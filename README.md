@@ -12,7 +12,7 @@ v0.1 的报告审阅流程（逐句切分、flag 规则、复核）已完整存�
 
 ```text
 app/
-  config.py            设置：模型、接口地址、是否允许真实调用、步数上限
+  config.py            设置：模型、接口地址、步数上限
   llm.py               唯一构造聊天模型的地方（langchain-openai，OpenAI 兼容接口）
   agent/
     graph.py           build_graph(model, tools, checkpointer=None, store=None)
@@ -35,7 +35,7 @@ uv run --locked pytest -q
 uv run --locked uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-默认不调用真实模型，`/chat` 返回 503 `live_calls_disabled`。要真实调用，复制 `.env.example` 为 `.env`，填入密钥，并设置 `CHARON_ALLOW_LIVE=true`。
+复制 `.env.example` 为 `.env`，把 `replace-with-your-key` 换成真实密钥后，`/chat` 会调用配置的模型。没有密钥时返回 503 `missing_api_key`；请求超时返回 504，上游 API 报错返回 502。测试使用脚本化假模型，不会发起真实请求。
 
 ```bash
 curl http://127.0.0.1:8000/chat -H 'Content-Type: application/json' -d '{"message":"Hello","thread_id":"demo"}'
