@@ -14,7 +14,3 @@ __pycache__/
 .vscode/
 .DS_Store
 .claude/
-
-# Local data left from the archived v0.1 review pipeline
-records/
-outputs/
