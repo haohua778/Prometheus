@@ -21,7 +21,7 @@ class Settings(BaseSettings):
                                           validation_alias=AliasChoices('LLM_TEMPERATURE'))
     llm_timeout_seconds: float = Field(default=60, gt=0, le=300,
                                        validation_alias=AliasChoices('LLM_TIMEOUT_SECONDS'))
-    # Graph steps per chat turn; each model call and each tool round is one step.
+    # Graph execution budget per chat turn; model retries inside a node do not use extra graph steps.
     max_steps: int = Field(default=20, ge=3, le=50, validation_alias=AliasChoices('PROMETHEUS_MAX_STEPS'))
 
 

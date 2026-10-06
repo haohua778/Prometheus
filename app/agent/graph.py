@@ -1,30 +1,37 @@
 """Prometheus's agent loop: the model answers or calls tools, and tool results go back to the model.
 
-Before a final answer is returned, the model reviews it and may send it back for revision.
+A plain reply is held as a draft while the model reviews it. Only the accepted draft, or the last
+draft once the review limit is reached, is committed to the thread history.
 """
 from collections.abc import Sequence
 from typing import Any, Literal
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage, get_buffer_string
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.store.base import BaseStore
 
-from app.agent.prompts import REVIEW_PROMPT, REVISION_PROMPT, SYSTEM_PROMPT
+from app.agent.prompts import REVISION_PROMPT, SYSTEM_PROMPT
+from app.agent.review import review_draft
+from app.agent.state import AgentState
 
-# Reviews per turn; after the last one the current answer is returned whatever the verdict.
-MAX_ITERATIONS = 3
+# Reviews per turn; after the last one the current draft is committed whatever the verdict.
+MAX_REVIEWS_PER_TURN = 3
 
 
-class AgentState(MessagesState):
-    answer: str                                   # the reply under review
-    review: str | None                            # reviewer's notes
-    decision: Literal['continue', 'stop'] | None  # 'continue' = revise again, 'stop' = accept
-    iteration: int                                # reviews done this turn
+def _require_draft(state: AgentState, node_name: str) -> AIMessage:
+    draft = state.get('draft')
+    if draft is None:
+        raise RuntimeError(f'{node_name} expected a draft reply, but the state has none')
+    return draft
+
+
+def _needs_another_revision(decision: Literal['continue', 'stop'] | None, review_count: int) -> bool:
+    return decision == 'continue' and review_count < MAX_REVIEWS_PER_TURN
 
 
 def build_graph(model: BaseChatModel, tools: Sequence[BaseTool] = (), *,
@@ -32,41 +39,52 @@ def build_graph(model: BaseChatModel, tools: Sequence[BaseTool] = (), *,
                 store: BaseStore | None = None) -> CompiledStateGraph:
     """Compile the agent and its review step.
 
-    A checkpointer keeps each thread's messages between calls (short-term memory);
-    a store holds facts shared across threads (long-term memory). Both are optional.
+    An optional checkpointer saves each thread's state, including messages and review fields.
+    The optional store is available to graph nodes for cross-thread data; current nodes do not use it.
     """
-    tools = list(tools)
-    bound = model.bind_tools(tools) if tools else model
+    available_tools = list(tools)
+    agent_model = model.bind_tools(available_tools) if available_tools else model
 
-    async def agent(state: AgentState) -> dict[str, Any]:
-        prompt = [SystemMessage(SYSTEM_PROMPT), *state['messages']]
+    async def generate_response(state: AgentState) -> dict[str, Any]:
+        prompt_messages = [SystemMessage(SYSTEM_PROMPT), *state['messages']]
         if state.get('decision') == 'continue':
-            # Reviewer feedback goes into this prompt only, not into the thread history.
-            prompt.append(HumanMessage(REVISION_PROMPT.format(review=state['review'])))
-        response = await bound.ainvoke(prompt)
-        return {'messages': [response]}
+            # The rejected draft and the reviewer's notes go into this prompt only, not into the thread history.
+            draft = _require_draft(state, 'agent')
+            prompt_messages.append(HumanMessage(REVISION_PROMPT.format(draft=draft.text, review=state['review'])))
+        model_response = await agent_model.ainvoke(prompt_messages)
+        if model_response.tool_calls:
+            # Tool calls join the history now; the draft and review notes stay until the revision is written.
+            return {'messages': [model_response]}
+        return {'draft': model_response}
 
-    async def reflect(state: AgentState) -> dict[str, Any]:
-        transcript = get_buffer_string(state['messages'], format='xml')
-        response = await model.ainvoke([SystemMessage(REVIEW_PROMPT), HumanMessage(transcript)])
-        text = str(response.text).strip()
-        # Fail open: anything but an explicit REVISE accepts the answer.
-        decision = 'continue' if text.upper().startswith('REVISE') else 'stop'
-        return {'answer': str(state['messages'][-1].text), 'review': text, 'decision': decision,
-                'iteration': state.get('iteration', 0) + 1}
+    async def review_response(state: AgentState) -> dict[str, Any]:
+        draft = _require_draft(state, 'reflect')
+        # Raises ReviewFormatError on a malformed verdict; an unreadable review never passes the draft.
+        review = await review_draft(model, state['messages'], draft)
+        review_decision = 'continue' if review.verdict == 'REVISE' else 'stop'
+        review_count = state.get('iteration', 0) + 1
+        review_outcome = {'review': review.feedback, 'decision': review_decision, 'iteration': review_count}
+        if _needs_another_revision(review_decision, review_count):
+            return review_outcome
+        return {**review_outcome, 'messages': [draft], 'answer': str(draft.text), 'draft': None}
 
-    def after_review(state: AgentState) -> str:
-        return 'agent' if state['decision'] == 'continue' and state['iteration'] < MAX_ITERATIONS else END
+    def route_after_review(state: AgentState) -> str:
+        if _needs_another_revision(state['decision'], state['iteration']):
+            return 'agent'
+        return END
 
-    builder = StateGraph(AgentState)
-    builder.add_node('agent', agent)
-    builder.add_node('reflect', reflect)
-    builder.add_edge(START, 'agent')
-    if tools:
-        builder.add_node('tools', ToolNode(tools))
-        builder.add_conditional_edges('agent', tools_condition, {'tools': 'tools', END: 'reflect'})
-        builder.add_edge('tools', 'agent')
+    graph_builder = StateGraph(AgentState)
+    graph_builder.add_node('agent', generate_response)
+    graph_builder.add_node('reflect', review_response)
+    graph_builder.add_edge(START, 'agent')
+    if available_tools:
+        graph_builder.add_node('tools', ToolNode(available_tools))
+        # A plain reply only updates draft, so messages[-1] is then the user's message or a finished
+        # tool result and tools_condition routes to reflect; only new tool calls are written to messages
+        # and route to tools.
+        graph_builder.add_conditional_edges('agent', tools_condition, {'tools': 'tools', END: 'reflect'})
+        graph_builder.add_edge('tools', 'agent')
     else:
-        builder.add_edge('agent', 'reflect')
-    builder.add_conditional_edges('reflect', after_review, ['agent', END])
-    return builder.compile(checkpointer=checkpointer, store=store)
+        graph_builder.add_edge('agent', 'reflect')
+    graph_builder.add_conditional_edges('reflect', route_after_review, ['agent', END])
+    return graph_builder.compile(checkpointer=checkpointer, store=store)
