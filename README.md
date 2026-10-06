@@ -19,7 +19,7 @@ Prometheus 是一个面向分析师的 Agent 服务。分析师负责判断和�
 cp .env.example .env
 uv sync --locked
 uv run --locked pytest -q
-uv run --locked uvicorn app.main:app --host 127.0.0.1 --port 8000
+uv run --locked uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
 服务启动后，可以在另一个终端检查接口：
@@ -33,6 +33,36 @@ curl http://127.0.0.1:8000/chat \
 
 `/chat` 的 `message` 必填，长度为 1–20,000 个字符；`thread_id` 可省略，填写时只能使用字母、数字、下划线和连字符，长度为 1–64 个字符。成功响应形如 `{"thread_id":"demo","reply":"..."}`。没有密钥或密钥为空时返回 503 `missing_api_key`；上游请求超时返回 504 `upstream_timeout`，上游 API 报错返回 502 `upstream_error`，审查结果经一次格式补问后仍不合法返回 502 `review_output_invalid`，超过图步数上限返回 500 `step_limit_reached`。服务不会在模型调用失败时改用假模型。
 
+## 运行日志
+
+服务启动时配置 `prometheus` logger，向标准输出写入逐行 JSON。默认级别为 `INFO`，可以在
+`.env` 中设置 `PROMETHEUS_LOG_LEVEL=DEBUG|INFO|WARNING|ERROR|CRITICAL`。不新增日志文件或依赖；
+容器/Databricks 等宿主负责收集、保存和轮转标准输出。上面的启动命令关闭 Uvicorn access log，
+避免重复请求日志以及原始 URL/query 被默认 access log 记录。
+
+- `service.started/stopped`：服务生命周期，启动记录模型名、工具数量和图步数上限。
+- `http.started/completed`：每个请求的服务端 `request_id`、方法、路由模板、HTTP 状态码和耗时。
+  响应头 `X-Request-ID` 返回同一个 ID，可据此查找整次请求的日志。未知路径只记录 `<unmatched>`。
+- `chat.started/completed/failed`：增加 `thread_id`，记录审核轮数、耗时及现有 API 错误码。
+  相同 `thread_id` 的不同请求仍有不同 `request_id`；这不意味着服务已启用对话记忆。
+- `llm.started/completed/failed`：记录实际模型调用的 span ID、耗时、异常类型，以及供应商提供时的
+  数字 token 用量。一次事件代表一次逻辑模型调用，不单独展开 SDK 内部的网络重试。
+- `tool.started/completed/failed`：记录工具名、span ID 和耗时；ToolNode 将失败转换为错误结果时也记录为失败。
+- `review.completed/format_retry/format_failed/limit_reached`：区分有效审查、格式补问、格式失败和到达审查上限。
+  `limit_reached` 为 WARNING，表示仍要求修改但按现有规则提交当前回答，不表示审查通过。
+- `http.failed`：未映射异常的类型和栈位置（文件、行号、函数），不包含异常正文或局部变量。
+  `http.cancelled`：请求任务被取消；完成日志中的 499 是诊断标记，不是向断开的客户端发送响应。
+
+示例（字段值仅作说明）：
+
+```json
+{"timestamp":"2026-10-06T12:00:00+00:00","level":"INFO","event":"chat.completed","request_id":"abc123","thread_id":"demo","duration_ms":125.4,"review_count":1}
+```
+
+应用事件不记录请求/响应正文、提示词、草稿、审查意见、工具参数/结果、密钥或上游异常正文。
+Uvicorn 与第三方 SDK 的日志是独立来源，不由此 JSON formatter 接管；不要为真实业务开启会输出
+完整 HTTP 请求/响应的 SDK debug 日志，宿主收集未捕获异常回溯时也需要检查其中的敏感内容。
+
 ## 代码结构
 
 ```text
@@ -40,6 +70,7 @@ app/
   config.py            模型配置和每轮图步数上限
   llm.py               构造 OpenAI 兼容的聊天模型
   schemas.py           接口请求、响应字段及 Pydantic 校验规则
+  runtime_logging.py   JSON 运行日志、请求上下文与模型/工具回调
   agent/
     state.py           完整 State 字段、消息合并规则和每轮输入初始化
     graph.py           Agent、工具循环和回答审查；build_graph 预留记忆参数

@@ -4,6 +4,7 @@ A plain reply is held as a draft while the model reviews it. Only the accepted d
 draft once the review limit is reached, is committed to the thread history.
 """
 from collections.abc import Sequence
+import logging
 from typing import Any, Literal
 
 from langchain_core.language_models import BaseChatModel
@@ -18,6 +19,7 @@ from langgraph.store.base import BaseStore
 from app.agent.prompts import REVISION_PROMPT, SYSTEM_PROMPT
 from app.agent.review import review_draft
 from app.agent.state import AgentState
+from app.runtime_logging import log_event
 
 # Reviews per turn; after the last one the current draft is committed whatever the verdict.
 MAX_REVIEWS_PER_TURN = 3
@@ -63,6 +65,10 @@ def build_graph(model: BaseChatModel, tools: Sequence[BaseTool] = (), *,
         review = await review_draft(model, state['messages'], draft)
         review_decision = 'continue' if review.verdict == 'REVISE' else 'stop'
         review_count = state.get('iteration', 0) + 1
+        limit_reached = review.verdict == 'REVISE' and review_count >= MAX_REVIEWS_PER_TURN
+        log_event('review.limit_reached' if limit_reached else 'review.completed',
+                  level=logging.WARNING if limit_reached else logging.INFO,
+                  verdict=review.verdict, review_count=review_count)
         review_outcome = {'review': review.feedback, 'decision': review_decision, 'iteration': review_count}
         if _needs_another_revision(review_decision, review_count):
             return review_outcome

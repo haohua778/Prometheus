@@ -5,6 +5,7 @@ with one JSON object. The answer is validated locally; a malformed answer is ask
 with the validation error, after which the review fails instead of passing the draft.
 """
 import json
+import logging
 from typing import Any, Literal
 
 from langchain_core.language_models import BaseChatModel
@@ -12,6 +13,7 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemM
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from app.agent.prompts import REVIEW_FORMAT_RETRY_PROMPT, REVIEW_PROMPT
+from app.runtime_logging import log_event
 
 # Message classes to the role names used in the review input.
 _ROLES = {'human': 'user', 'ai': 'assistant', 'tool': 'tool', 'system': 'system'}
@@ -69,6 +71,7 @@ async def review_draft(model: BaseChatModel, messages: list[AnyMessage], draft: 
     try:
         return ReviewResult.model_validate_json(first_answer.text)
     except ValidationError as first_error:
+        log_event('review.format_retry', level=logging.WARNING, attempt=1)
         # The invalid answer goes back as plain text so stray tool calls or metadata are not replayed.
         retry_prompt = [*review_prompt, AIMessage(first_answer.text),
                         HumanMessage(REVIEW_FORMAT_RETRY_PROMPT.format(error=first_error))]
@@ -76,4 +79,5 @@ async def review_draft(model: BaseChatModel, messages: list[AnyMessage], draft: 
         try:
             return ReviewResult.model_validate_json(second_answer.text)
         except ValidationError as second_error:
+            log_event('review.format_failed', level=logging.ERROR, attempt=2)
             raise ReviewFormatError('reviewer returned an invalid review twice') from second_error

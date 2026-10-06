@@ -1,6 +1,7 @@
 """Runtime settings for the LLM-backed agent."""
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,6 +24,8 @@ class Settings(BaseSettings):
                                        validation_alias=AliasChoices('LLM_TIMEOUT_SECONDS'))
     # Graph execution budget per chat turn; model retries inside a node do not use extra graph steps.
     max_steps: int = Field(default=20, ge=3, le=50, validation_alias=AliasChoices('PROMETHEUS_MAX_STEPS'))
+    log_level: Literal['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'] = Field(
+        default='INFO', validation_alias='PROMETHEUS_LOG_LEVEL')
 
 
 @lru_cache(maxsize=1)
