@@ -1,7 +1,7 @@
-"""Structured operational events, without prompts, tool arguments or provider error bodies."""
 import json
 import logging
 import sys
+import traceback
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from time import perf_counter
@@ -11,6 +11,7 @@ from uuid import UUID
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.outputs import LLMResult
 
+# ContextVar keeps correlation IDs isolated between concurrent requests.
 request_id_context: ContextVar[str | None] = ContextVar('request_id', default=None)
 thread_id_context: ContextVar[str | None] = ContextVar('thread_id', default=None)
 logger = logging.getLogger('prometheus')
@@ -29,7 +30,7 @@ class JsonFormatter(logging.Formatter):
 
 
 def configure_logging(level: str) -> None:
-    # Configure only our namespace; leave Uvicorn's handlers under the host's control.
+    # Configure the application logger and reuse its handler on repeated calls.
     if not any(isinstance(handler.formatter, JsonFormatter) for handler in logger.handlers):
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(JsonFormatter())
@@ -42,32 +43,49 @@ def log_event(event: str, *, level: int = logging.INFO, **fields: Any) -> None:
     logger.log(level, event, extra={'event_fields': fields})
 
 
+def exception_fields(error: BaseException) -> dict[str, Any]:
+    # Keep code locations while excluding exception messages and local variables.
+    return {
+        'error_type': type(error).__name__,
+        'stack': [{'file': frame.filename, 'line': frame.lineno, 'function': frame.name}
+                  for frame in traceback.extract_tb(error.__traceback__)],
+    }
+
+
 class RuntimeLogCallback(AsyncCallbackHandler):
-    """Observe actual model/tool execution through LangChain's existing callback contract."""
+    """Record model and tool execution through LangChain callbacks."""
 
     def __init__(self) -> None:
         self.started: dict[UUID, float] = {}
+        self.tool_names: dict[UUID, str | None] = {}
 
     def _start(self, kind: str, run_id: UUID, parent_run_id: UUID | None, **fields: Any) -> None:
         self.started[run_id] = perf_counter()
-        log_event(f'{kind}.started', span_id=str(run_id),
-                  parent_span_id=str(parent_run_id) if parent_run_id else None, **fields)
+        log_event(f'{kind}.started', span_id=str(run_id), parent_span_id=str(parent_run_id) if parent_run_id else None, **fields)
 
-    def _end(self, kind: str, run_id: UUID, *, error: BaseException | None = None,
-             failed: bool = False, **fields: Any) -> None:
+    def _end(self, kind: str, run_id: UUID, *, error: BaseException | None = None, failed: bool = False, **fields: Any) -> None:
         started = self.started.pop(run_id, None)
         failed = failed or error is not None
-        log_event(f'{kind}.failed' if failed else f'{kind}.completed',
-                  level=logging.ERROR if failed else logging.INFO, span_id=str(run_id),
-                  duration_ms=round((perf_counter() - started) * 1000, 2) if started is not None else None,
-                  **({'error_type': type(error).__name__} if error else {}), **fields)
+        event = f'{kind}.failed' if failed else f'{kind}.completed'
+        level = logging.ERROR if failed else logging.INFO
+        duration_ms = round((perf_counter() - started) * 1000, 2) if started is not None else None
+        if kind == 'tool':
+            fields['tool_name'] = self.tool_names.pop(run_id, None)
+        if error is not None:
+            fields.update(exception_fields(error))
+        log_event(event, level=level, span_id=str(run_id), duration_ms=duration_ms, **fields)
 
-    async def on_chat_model_start(self, serialized: dict[str, Any], messages: Any, *,
-                                  run_id: UUID, parent_run_id: UUID | None = None, **kwargs: Any) -> None:
+    def finish_pending(self) -> None:
+        # Cancellation can bypass the framework's model/tool end callbacks.
+        for run_id in list(self.started):
+            kind = 'tool' if run_id in self.tool_names else 'llm'
+            self._end(kind, run_id, failed=True, outcome='interrupted')
+
+    async def on_chat_model_start(self, serialized: dict[str, Any], messages: Any, *, run_id: UUID, parent_run_id: UUID | None = None, **kwargs: Any) -> None:
         self._start('llm', run_id, parent_run_id)
 
     async def on_llm_end(self, response: LLMResult, *, run_id: UUID, **kwargs: Any) -> None:
-        # Copy only numeric token counters; response metadata may contain provider payloads.
+        # Copy only numeric token counts to avoid logging raw provider payloads.
         tokens: dict[str, int] = {}
         if response.generations and response.generations[0]:
             message = getattr(response.generations[0][0], 'message', None)
@@ -79,12 +97,12 @@ class RuntimeLogCallback(AsyncCallbackHandler):
     async def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         self._end('llm', run_id, error=error)
 
-    async def on_tool_start(self, serialized: dict[str, Any], input_str: str, *,
-                            run_id: UUID, parent_run_id: UUID | None = None, **kwargs: Any) -> None:
+    async def on_tool_start(self, serialized: dict[str, Any], input_str: str, *, run_id: UUID, parent_run_id: UUID | None = None, **kwargs: Any) -> None:
+        self.tool_names[run_id] = serialized.get('name')
         self._start('tool', run_id, parent_run_id, tool_name=serialized.get('name'))
 
     async def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs: Any) -> None:
-        # ToolNode may turn a tool failure into a ToolMessage instead of raising it.
+        # ToolNode may convert exceptions into error results, so check the result status too.
         if getattr(output, 'status', None) == 'error':
             self._end('tool', run_id, failed=True, outcome='error_result')
         else:

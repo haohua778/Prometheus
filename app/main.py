@@ -1,7 +1,6 @@
 """HTTP entry point: a health check and one chat endpoint over the agent graph."""
 import asyncio
 import logging
-import traceback
 from contextlib import asynccontextmanager
 from time import perf_counter
 from typing import Annotated
@@ -11,6 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
 from openai import APIError, APITimeoutError
+from starlette.routing import Match
 
 from app.agent.graph import build_graph
 from app.agent.review import ReviewFormatError
@@ -19,7 +19,7 @@ from app.agent.tools import TOOLS
 from app.config import Settings, get_settings
 from app.llm import MissingAPIKeyError, build_chat_model
 from app.schemas import ChatRequest, ChatResponse
-from app.runtime_logging import (RuntimeLogCallback, configure_logging, log_event,
+from app.runtime_logging import (RuntimeLogCallback, configure_logging, exception_fields, log_event,
                                  request_id_context, thread_id_context)
 
 
@@ -35,6 +35,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title='Prometheus', lifespan=lifespan)
+
+
+def request_route(request: Request) -> str:
+    route = request.scope.get('route')
+    if route is not None:
+        return route.path
+    # Built-in documentation routes may not populate scope['route'].
+    for registered_route in request.app.routes:
+        match, _ = registered_route.matches(request.scope)
+        if match != Match.NONE:
+            return registered_route.path
+    return '<unmatched>'
 
 
 @app.middleware('http')
@@ -54,16 +66,12 @@ async def request_logging(request: Request, call_next):
         log_event('http.cancelled', level=logging.WARNING)
         raise
     except Exception as exc:
-        # Stack locations are useful; exception strings and locals can contain document text or secrets.
-        log_event('http.failed', level=logging.ERROR, error_type=type(exc).__name__,
-                  stack=[{'file': frame.filename, 'line': frame.lineno, 'function': frame.name}
-                         for frame in traceback.extract_tb(exc.__traceback__)])
+        log_event('http.failed', level=logging.ERROR, **exception_fields(exc))
         raise
     finally:
-        route = request.scope.get('route')
         log_event('http.completed', level=logging.ERROR if status_code >= 500 else
                   logging.WARNING if status_code >= 400 else logging.INFO,
-                  method=request.method, route=getattr(route, 'path', '<unmatched>'),
+                  method=request.method, route=request_route(request),
                   status_code=status_code, duration_ms=round((perf_counter() - started) * 1000, 2))
         request_id_context.reset(token)
 
@@ -87,8 +95,9 @@ async def chat(request: ChatRequest,
                settings: Annotated[Settings, Depends(get_settings)]) -> ChatResponse:
     thread_id = request.thread_id or uuid4().hex
     thread_token = thread_id_context.set(thread_id)
+    runtime_logs = RuntimeLogCallback()
     run_config = {'configurable': {'thread_id': thread_id}, 'recursion_limit': settings.max_steps,
-                  'callbacks': [RuntimeLogCallback()]}
+                  'callbacks': [runtime_logs]}
     turn_input = create_turn_state(request.message)
     started = perf_counter()
     log_event('chat.started', model=settings.llm_model, max_steps=settings.max_steps)
@@ -111,4 +120,5 @@ async def chat(request: ChatRequest,
                   review_count=final_state.get('iteration', 0))
         return ChatResponse(thread_id=thread_id, reply=final_state['answer'])
     finally:
+        runtime_logs.finish_pending()
         thread_id_context.reset(thread_token)

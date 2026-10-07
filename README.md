@@ -9,7 +9,7 @@ Prometheus 是一个面向分析师的 Agent 服务。分析师负责判断和�
 - 模型生成的回答先暂存在 `draft`，再进入 `reflect` 节点。审查输入和输出均使用 JSON，输出经过 Pydantic 校验后按 `verdict` 决定通过或修改；每轮最多完成 3 次有效审查，达到上限后即使仍要求修改，也返回当前回答。审查结束时才把最终选用的回答写入消息历史，中间废稿和审查意见不会加入 `messages`；实际工具调用及结果仍会保留。审查由同一个模型完成，不保证回答一定正确。
 - 审查输出格式不合法时，基于同份材料最多补问一次；再次失败返回明确错误，不默认通过，也不提交草稿。格式补问不计入有效审查次数，不触发回答重写。
 - `thread_id` 可以由请求提供，也可以由服务生成。目前服务没有接入对话记忆；重复使用同一个 `thread_id` 不会自动带入之前的对话。
-- 测试使用脚本化假模型验证接口和流程，不发送真实模型请求，也不验证真实模型的回答质量。
+- 现有接口和图流程测试使用脚本化模型；日志测试使用真实 HTTP 服务和真实工具调用。真实模型日志测试需要显式开启，不评估回答质量。
 
 ## 本地运行
 
@@ -36,8 +36,9 @@ curl http://127.0.0.1:8000/chat \
 ## 运行日志
 
 服务启动时配置 `prometheus` logger，向标准输出写入逐行 JSON。默认级别为 `INFO`，可以在
-`.env` 中设置 `PROMETHEUS_LOG_LEVEL=DEBUG|INFO|WARNING|ERROR|CRITICAL`。不新增日志文件或依赖；
-容器/Databricks 等宿主负责收集、保存和轮转标准输出。上面的启动命令关闭 Uvicorn access log，
+`.env` 中设置 `PROMETHEUS_LOG_LEVEL=INFO`，可选 DEBUG、INFO、WARNING、ERROR 或 CRITICAL。不新增日志文件或依赖；
+运行环境负责收集标准输出。Databricks Apps 默认 Logs 页面在应用计算资源关闭后不保留日志；
+长期留存需要配置平台日志采集和持久存储。上面的启动命令关闭 Uvicorn access log，
 避免重复请求日志以及原始 URL/query 被默认 access log 记录。
 
 - `service.started/stopped`：服务生命周期，启动记录模型名、工具数量和图步数上限。
@@ -47,10 +48,11 @@ curl http://127.0.0.1:8000/chat \
   相同 `thread_id` 的不同请求仍有不同 `request_id`；这不意味着服务已启用对话记忆。
 - `llm.started/completed/failed`：记录实际模型调用的 span ID、耗时、异常类型，以及供应商提供时的
   数字 token 用量。一次事件代表一次逻辑模型调用，不单独展开 SDK 内部的网络重试。
-- `tool.started/completed/failed`：记录工具名、span ID 和耗时；ToolNode 将失败转换为错误结果时也记录为失败。
+- `tool.started/completed/failed`：开始和结束事件都记录工具名及 span ID，结束记录耗时；ToolNode 将失败转换为错误结果时也记录为失败。异常记录代码位置。
+- 请求结束时仍未收到完成回调的模型/工具调用记录为失败，`outcome=interrupted`；例如取消请求可能跳过框架的结束回调。
 - `review.completed/format_retry/format_failed/limit_reached`：区分有效审查、格式补问、格式失败和到达审查上限。
   `limit_reached` 为 WARNING，表示仍要求修改但按现有规则提交当前回答，不表示审查通过。
-- `http.failed`：未映射异常的类型和栈位置（文件、行号、函数），不包含异常正文或局部变量。
+- `http.failed`：未映射异常的类型和调用位置（文件、行号、函数），不包含异常正文或局部变量。
   `http.cancelled`：请求任务被取消；完成日志中的 499 是诊断标记，不是向断开的客户端发送响应。
 
 示例（字段值仅作说明）：
@@ -62,6 +64,15 @@ curl http://127.0.0.1:8000/chat \
 应用事件不记录请求/响应正文、提示词、草稿、审查意见、工具参数/结果、密钥或上游异常正文。
 Uvicorn 与第三方 SDK 的日志是独立来源，不由此 JSON formatter 接管；不要为真实业务开启会输出
 完整 HTTP 请求/响应的 SDK debug 日志，宿主收集未捕获异常回溯时也需要检查其中的敏感内容。
+
+独立运行日志检查（使用真实 Uvicorn HTTP 请求和工具，不调用模型供应商）：
+
+```bash
+uv run --locked pytest tests/test_runtime_logging.py -q
+```
+
+验证 `.env` 中配置的真实模型时，设置 `PROMETHEUS_LIVE_LOG_TEST=1` 后运行相同命令。
+该测试执行一次真实对话及其 Reflection，会产生供应商用量费用。默认跳过。
 
 ## 代码结构
 
@@ -78,7 +89,7 @@ app/
     prompts.py         系统提示、审查提示和修改提示
     tools/__init__.py  工具注册表 TOOLS（当前为空）
   main.py              FastAPI 接口：GET /health、POST /chat
-tests/                 使用脚本化假模型的离线测试
+tests/                 接口、图流程与运行日志测试
 ```
 
 要添加工具，在 `app/agent/tools/` 下编写带类型注解和文档字符串的函数，用 `langchain_core.tools.tool` 装饰，再加入 `TOOLS`，并在 `tests/` 中验证工具调用与结果返回模型的流程。

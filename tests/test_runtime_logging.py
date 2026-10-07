@@ -1,175 +1,223 @@
-"""Exercise real HTTP/graph paths and verify diagnostic events never include payloads."""
 import asyncio
 import io
 import json
 import logging
+import os
+import socket
+import subprocess
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+from time import sleep
+from uuid import uuid4
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage
-from openai import APIError, APITimeoutError
+from langchain_core.tools import tool
 
-from app.agent.graph import MAX_REVIEWS_PER_TURN, build_graph
-from app.config import get_settings
-from app.main import app, get_agent_graph
-from app.runtime_logging import JsonFormatter, logger, request_id_context, thread_id_context
-from tests.conftest import ScriptedChatModel, add, make_review_message, make_tool_call_message
-
-SECRET = 'sensitive-document-and-api-key'
+from app.runtime_logging import (JsonFormatter, RuntimeLogCallback, configure_logging, log_event,
+                                 logger, request_id_context, thread_id_context)
 
 
 @pytest.fixture
-def events(offline_settings):
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
+def events():
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
     handler.setFormatter(JsonFormatter())
-    old_level = logger.level
-    logger.addHandler(handler)
+    handlers, level, propagate = logger.handlers[:], logger.level, logger.propagate
+    logger.handlers = [handler]
     logger.setLevel(logging.INFO)
-    app.dependency_overrides[get_settings] = lambda: offline_settings
-    yield lambda: [json.loads(line) for line in stream.getvalue().splitlines()]
-    app.dependency_overrides.clear()
-    logger.removeHandler(handler)
-    logger.setLevel(old_level)
+    logger.propagate = False
+    try:
+        yield lambda: [json.loads(line) for line in output.getvalue().splitlines()]
+    finally:
+        logger.handlers = handlers
+        logger.setLevel(level)
+        logger.propagate = propagate
 
 
-def use_model(replies, tools=()):
-    graph = build_graph(ScriptedChatModel(replies=replies), tools)
-    app.dependency_overrides[get_agent_graph] = lambda: graph
+def available_port():
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        return listener.getsockname()[1]
 
 
-def test_success_correlates_http_model_tool_and_review_without_payloads(events):
-    use_model([make_tool_call_message('add', {'a': 1, 'b': 2}),
-               AIMessage(SECRET, usage_metadata={'input_tokens': 4, 'output_tokens': 2, 'total_tokens': 6}),
-               make_review_message()], [add])
-    with TestClient(app) as client:
-        response = client.post('/chat', json={'message': SECRET, 'thread_id': 'thread-a'})
-    assert response.status_code == 200
-    records = events()
-    run_records = [record for record in records if record['request_id']]
-    assert {record['request_id'] for record in run_records} == {response.headers['X-Request-ID']}
-    graph_records = [record for record in run_records if not record['event'].startswith('http.')]
-    assert {record['thread_id'] for record in graph_records} == {'thread-a'}
-    names = [record['event'] for record in records]
-    assert names.count('llm.completed') == 3
-    assert names.count('tool.completed') == 1
-    assert {'review.completed', 'chat.completed', 'http.completed', 'service.started', 'service.stopped'} <= set(names)
-    assert any(record.get('total_tokens') == 6 for record in records)
-    assert all(record['duration_ms'] >= 0 for record in records if 'duration_ms' in record)
-    assert SECRET not in json.dumps(records)
+@contextmanager
+def running_service(*, use_configured_model=False, **settings):
+    directory = Path(__file__).resolve().parents[1] / '.runtime' / f'logging-test-{uuid4().hex}'
+    directory.mkdir(parents=True)
+    port = available_port()
+    env = dict(os.environ, PROMETHEUS_LOG_LEVEL='INFO', PYTHONIOENCODING='utf-8')
+    if not use_configured_model:
+        env['LLM_API_KEY'] = ''
+    env.update(settings)
+    with (directory / 'stdout.log').open('w+', encoding='utf-8') as output, \
+            (directory / 'stderr.log').open('w+', encoding='utf-8') as errors:
+        process = subprocess.Popen(
+            [sys.executable, '-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1',
+             '--port', str(port), '--no-access-log'],
+            cwd=directory.parents[1], stdout=output, stderr=errors, env=env)
+        try:
+            with httpx.Client(base_url=f'http://127.0.0.1:{port}', trust_env=False, timeout=180) as client:
+                for _ in range(100):
+                    if process.poll() is not None:
+                        pytest.fail('Uvicorn exited before startup; inspect .runtime logging-test files')
+                    try:
+                        if client.get('/health').status_code == 200:
+                            break
+                    except httpx.ConnectError:
+                        pass
+                    sleep(0.1)
+                else:
+                    pytest.fail('Uvicorn startup timed out')
+
+                def records():
+                    output.seek(0)
+                    return [json.loads(line) for line in output.read().splitlines()]
+
+                yield client, records
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
 
 
-@pytest.mark.parametrize('kind,code,status', [
-    ('timeout', 'upstream_timeout', 504), ('provider', 'upstream_error', 502),
-    ('review', 'review_output_invalid', 502), ('steps', 'step_limit_reached', 500),
-    ('key', 'missing_api_key', 503),
-])
-def test_failures_keep_api_contract_and_log_error_codes_without_error_bodies(events, kind, code, status):
-    request = httpx.Request('POST', f'https://example.invalid/?token={SECRET}')
-    if kind == 'timeout':
-        use_model([APITimeoutError(request=request)])
-    elif kind == 'provider':
-        use_model([APIError(SECRET, request=request, body={'secret': SECRET})])
-    elif kind == 'review':
-        use_model([AIMessage(SECRET), AIMessage(SECRET), AIMessage(SECRET)])
-    elif kind == 'steps':
-        use_model([make_tool_call_message('add', {'a': 1, 'b': 2})], [add])
-    with TestClient(app) as client:
-        response = client.post('/chat', json={'message': SECRET, 'thread_id': 'failure-thread'})
-    assert response.status_code == status
-    assert response.json()['detail'] == {'code': code}
-    assert any(record.get('error_code') == code for record in events())
-    assert any(record['event'] == 'http.completed' and record['status_code'] == status for record in events())
-    assert SECRET not in json.dumps(events())
+@tool
+def add_numbers(a: int, b: int) -> int:
+    """Add two integers."""
+    return a + b
 
 
-def test_review_retries_and_limit_are_distinguishable(events):
-    use_model([AIMessage(SECRET), AIMessage('invalid'), make_review_message('REVISE', SECRET)]
-              + [AIMessage(SECRET), make_review_message('REVISE', SECRET)] * (MAX_REVIEWS_PER_TURN - 1))
-    with TestClient(app) as client:
-        assert client.post('/chat', json={'message': SECRET}).status_code == 200
-    assert sum(record['event'] == 'review.format_retry' for record in events()) == 1
-    limit = next(record for record in events() if record['event'] == 'review.limit_reached')
-    assert limit['level'] == 'WARNING'
-    assert limit['review_count'] == MAX_REVIEWS_PER_TURN
-    assert SECRET not in json.dumps(events())
+@tool
+def divide_numbers(a: int, b: int) -> float:
+    """Divide two integers."""
+    return a / b
 
 
-def test_handled_tool_failure_is_not_logged_as_success(events):
-    use_model([make_tool_call_message('add', {'a': SECRET, 'b': 2}), AIMessage('Cannot add.'),
-               make_review_message()], [add])
-    with TestClient(app) as client:
-        assert client.post('/chat', json={'message': SECRET}).status_code == 200
-    assert any(record['event'] == 'tool.failed' for record in events())
-    assert not any(record['event'] == 'tool.completed' for record in events())
-    assert SECRET not in json.dumps(events())
-
-
-def test_unexpected_error_has_stack_locations_and_no_exception_message(events):
-    use_model([RuntimeError(SECRET)])
-    with TestClient(app, raise_server_exceptions=False) as client:
-        assert client.post('/chat', json={'message': SECRET}).status_code == 500
-    failure = next(record for record in events() if record['event'] == 'http.failed')
-    assert failure['error_type'] == 'RuntimeError'
-    assert failure['stack']
-    assert SECRET not in json.dumps(events())
-
-
-def test_validation_and_unmatched_paths_do_not_log_payload_or_raw_url(events):
-    use_model([AIMessage('unused')])
-    with TestClient(app) as client:
+def test_http_routes_errors_and_privacy():
+    with running_service(LLM_API_KEY='validation-only-key') as (client, events):
+        for path in ('/health', '/docs', '/openapi.json'):
+            response = client.get(path)
+            assert response.status_code == 200
+            assert any(record['event'] == 'http.completed' and record['route'] == path
+                       and record['request_id'] == response.headers['X-Request-ID'] for record in events())
+        missing = client.get('/PRIVATE_PATH?token=PRIVATE_QUERY')
+        assert missing.status_code == 404
+        assert any(record['route'] == '<unmatched>' and record['status_code'] == 404
+                   for record in events() if record['event'] == 'http.completed')
         assert client.post('/chat', json={'message': ''}).status_code == 422
-        assert client.get(f'/{SECRET}?token={SECRET}').status_code == 404
-    assert SECRET not in json.dumps(events())
-    assert {record['status_code'] for record in events() if record['event'] == 'http.completed'} == {422, 404}
+        assert client.get('/chat').status_code == 405
+        content = json.dumps(events())
+        assert 'PRIVATE_PATH' not in content
+        assert 'PRIVATE_QUERY' not in content
+        assert 'validation-only-key' not in content
+
+
+def test_missing_key_logs_correlated_error():
+    with running_service() as (client, events):
+        response = client.post('/chat', json={'message': 'PRIVATE_PAYLOAD'})
+        assert response.status_code == 503
+        assert response.json()['detail'] == {'code': 'missing_api_key'}
+        assert any(record.get('error_code') == 'missing_api_key'
+                   and record['request_id'] == response.headers['X-Request-ID'] for record in events())
+        assert 'PRIVATE_PAYLOAD' not in json.dumps(events())
+
+
+def test_real_connection_failure_preserves_api_error_and_code_locations():
+    with running_service(LLM_API_KEY='connection-test-key', LLM_TIMEOUT_SECONDS='10',
+                         LLM_BASE_URL=f'http://127.0.0.1:{available_port()}/v1') as (client, events):
+        response = client.post('/chat', json={'message': 'PRIVATE_PAYLOAD', 'thread_id': 'error-thread'})
+        assert response.status_code == 502
+        assert response.json()['detail'] == {'code': 'upstream_error'}
+        failure = next(record for record in events() if record['event'] == 'llm.failed')
+        assert failure['thread_id'] == 'error-thread'
+        assert failure['stack']
+        assert failure['duration_ms'] >= 0
+        assert 'connection-test-key' not in json.dumps(events())
+        assert 'PRIVATE_PAYLOAD' not in json.dumps(events())
 
 
 @pytest.mark.anyio
-async def test_concurrent_requests_keep_their_own_correlation_ids(events):
-    ready = asyncio.Event()
+async def test_real_tool_success_and_failure(events):
+    callback = RuntimeLogCallback()
+    assert await add_numbers.ainvoke({'a': 2, 'b': 3}, config={'callbacks': [callback]}) == 5
+    with pytest.raises(ZeroDivisionError):
+        await divide_numbers.ainvoke({'a': 1, 'b': 0}, config={'callbacks': [callback]})
+    completed = next(record for record in events() if record['event'] == 'tool.completed')
+    failure = next(record for record in events() if record['event'] == 'tool.failed')
+    assert completed['tool_name'] == 'add_numbers'
+    assert failure['tool_name'] == 'divide_numbers'
+    assert failure['error_type'] == 'ZeroDivisionError'
+    assert any(frame['function'] == 'divide_numbers' for frame in failure['stack'])
+    assert callback.started == {}
+    assert callback.tool_names == {}
 
-    class ConcurrentGraph:
-        async def ainvoke(self, state, config):
-            if config['configurable']['thread_id'] == 'first':
-                await ready.wait()
-            else:
-                ready.set()
-            return {'answer': 'ok', 'iteration': 1}
 
-    app.dependency_overrides[get_agent_graph] = ConcurrentGraph
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
-        responses = await asyncio.gather(*[
-            client.post('/chat', json={'message': 'hi', 'thread_id': thread}) for thread in ('first', 'second')
-        ])
-    identifiers = [response.headers['X-Request-ID'] for response in responses]
-    assert len(set(identifiers)) == 2
-    for thread, request_id in zip(('first', 'second'), identifiers):
-        records = [record for record in events() if record['request_id'] == request_id
-                   and record['event'].startswith('chat.')]
-        assert {record['event'] for record in records} == {'chat.started', 'chat.completed'}
-        assert {record['thread_id'] for record in records} == {thread}
+@pytest.mark.anyio
+async def test_concurrent_real_tools_keep_context_isolated(events):
+    async def invoke(identifier):
+        request_token = request_id_context.set(identifier)
+        thread_token = thread_id_context.set(f'thread-{identifier}')
+        try:
+            return await add_numbers.ainvoke({'a': 2, 'b': 3}, config={'callbacks': [RuntimeLogCallback()]})
+        finally:
+            thread_id_context.reset(thread_token)
+            request_id_context.reset(request_token)
+
+    assert await asyncio.gather(invoke('first'), invoke('second')) == [5, 5]
+    for identifier in ('first', 'second'):
+        records = [record for record in events() if record['request_id'] == identifier]
+        assert [record['event'] for record in records] == ['tool.started', 'tool.completed']
+        assert {record['thread_id'] for record in records} == {f'thread-{identifier}'}
+        assert len({record['span_id'] for record in records}) == 1
     assert request_id_context.get() is None
     assert thread_id_context.get() is None
 
 
 @pytest.mark.anyio
-async def test_cancelled_request_is_visible_and_does_not_leave_context(events):
+async def test_cancelled_real_tool_releases_callback_state(events):
     entered = asyncio.Event()
 
-    class WaitingGraph:
-        async def ainvoke(self, state, config):
-            entered.set()
-            await asyncio.Future()
+    @tool
+    async def wait_seconds(seconds: float) -> str:
+        """Wait for the requested number of seconds."""
+        entered.set()
+        await asyncio.sleep(seconds)
+        return 'done'
 
-    app.dependency_overrides[get_agent_graph] = WaitingGraph
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
-        task = asyncio.create_task(client.post('/chat', json={'message': 'hi'}))
+    callback = RuntimeLogCallback()
+    task = asyncio.create_task(wait_seconds.ainvoke({'seconds': 30}, config={'callbacks': [callback]}))
+    try:
         await asyncio.wait_for(entered.wait(), timeout=2)
+        assert callback.started
+    finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-    assert any(record['event'] == 'http.cancelled' for record in events())
-    assert any(record['event'] == 'http.completed' and record['status_code'] == 499 for record in events())
-    assert request_id_context.get() is None
-    assert thread_id_context.get() is None
+        callback.finish_pending()
+    assert any(record['event'] == 'tool.failed' and record['outcome'] == 'interrupted'
+               for record in events())
+    assert callback.started == {}
+    assert callback.tool_names == {}
+
+
+def test_configuration_is_idempotent_and_respects_level(events):
+    configure_logging('WARNING')
+    configure_logging('WARNING')
+    log_event('filtered.info')
+    log_event('visible.warning', level=logging.WARNING)
+    assert [record['event'] for record in events()] == ['visible.warning']
+
+
+@pytest.mark.skipif(os.environ.get('PROMETHEUS_LIVE_LOG_TEST') != '1', reason='Real model calls require opt-in')
+def test_live_model_and_reflection_logs():
+    with running_service(use_configured_model=True) as (client, events):
+        response = client.post('/chat', json={'message': 'Return exactly OK. LOG_PRIVACY_CHECK',
+                                              'thread_id': 'live-log-check'})
+        assert response.status_code == 200
+        assert response.json()['reply']
+        records = events()
+        assert sum(record['event'] == 'llm.completed' for record in records) >= 2
+        assert any(record['event'] in ('review.completed', 'review.limit_reached') for record in records)
+        assert any(record['event'] == 'chat.completed' and record['thread_id'] == 'live-log-check'
+                   for record in records)
+        assert 'LOG_PRIVACY_CHECK' not in json.dumps(records)
