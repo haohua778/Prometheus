@@ -35,44 +35,130 @@ curl http://127.0.0.1:8000/chat \
 
 ## 运行日志
 
-服务启动时配置 `prometheus` logger，向标准输出写入逐行 JSON。默认级别为 `INFO`，可以在
-`.env` 中设置 `PROMETHEUS_LOG_LEVEL=INFO`，可选 DEBUG、INFO、WARNING、ERROR 或 CRITICAL。不新增日志文件或依赖；
-运行环境负责收集标准输出。Databricks Apps 默认 Logs 页面在应用计算资源关闭后不保留日志；
-长期留存需要配置平台日志采集和持久存储。上面的启动命令关闭 Uvicorn access log，
-避免重复请求日志以及原始 URL/query 被默认 access log 记录。
+### 输出与配置
 
-- `service.started/stopped`：服务生命周期，启动记录模型名、工具数量和图步数上限。
-- `http.started/completed`：每个请求的服务端 `request_id`、方法、路由模板、HTTP 状态码和耗时。
-  响应头 `X-Request-ID` 返回同一个 ID，可据此查找整次请求的日志。未知路径只记录 `<unmatched>`。
-- `chat.started/completed/failed`：增加 `thread_id`，记录审核轮数、耗时及现有 API 错误码。
-  相同 `thread_id` 的不同请求仍有不同 `request_id`；这不意味着服务已启用对话记忆。
-- `llm.started/completed/failed`：记录实际模型调用的 span ID、耗时、异常类型，以及供应商提供时的
-  数字 token 用量。一次事件代表一次逻辑模型调用，不单独展开 SDK 内部的网络重试。
-- `tool.started/completed/failed`：开始和结束事件都记录工具名及 span ID，结束记录耗时；ToolNode 将失败转换为错误结果时也记录为失败。异常记录代码位置。
-- 请求结束时仍未收到完成回调的模型/工具调用记录为失败，`outcome=interrupted`；例如取消请求可能跳过框架的结束回调。
-- `review.completed/format_retry/format_failed/limit_reached`：区分有效审查、格式补问、格式失败和到达审查上限。
-  `limit_reached` 为 WARNING，表示仍要求修改但按现有规则提交当前回答，不表示审查通过。
-- `http.failed`：未映射异常的类型和调用位置（文件、行号、函数），不包含异常正文或局部变量。
-  `http.cancelled`：请求任务被取消；完成日志中的 499 是诊断标记，不是向断开的客户端发送响应。
+服务启动时配置 `prometheus` logger，每个事件输出一行 JSON 到 `stdout`（标准输出）。
+本地运行时显示在启动后端的终端中；应用默认不创建 `.log` 文件，也不按会话创建文件。
+日志使用 Python 标准库，模型和工具事件通过现有 LangChain 回调记录。
 
-示例（字段值仅作说明）：
+在 `.env` 中配置日志级别，修改后重新启动服务：
+
+```env
+PROMETHEUS_LOG_LEVEL=INFO
+```
+
+默认 `INFO` 保留正常执行记录、提醒和错误。可选值为 `DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`。
+选择 `WARNING` 或更高等级会过滤正常执行记录。此配置只控制应用自己的 logger。
+启动命令中的 `--no-access-log` 关闭 Uvicorn access log，避免重复记录请求和原始 URL/query。
+
+### 一次请求怎样记录
+
+1. HTTP 中间件生成 `request_id`，记录请求开始和处理结束，并在正常返回的响应头中附上 `X-Request-ID`。
+2. `/chat` 确定 `thread_id`，记录对话开始，并为这次图执行注册 `RuntimeLogCallback`。
+3. 框架在模型、工具调用开始或结束时触发回调，自动记录执行结果和耗时。生成回答与 Reflection 的模型调用都会记录。
+4. 审查代码记录审查结论、格式补问或审查上限；对话完成时记录处理耗时和审查轮数。
+5. 请求结束时收尾尚未完成的调用记录，清理关联 ID。服务进程退出或被强制终止时，无法保证最后的事件已输出。
+
+每次 HTTP 请求会产生多条日志。通过同一个 `request_id` 查找这一轮的全部事件；
+通过 `thread_id` 查找同一对话线程的多次请求。当前服务尚未启用对话记忆。
+`http.*` 事件的 `thread_id` 通常为 `null`，仍可通过 `request_id` 与对话事件关联。
+
+| 字段 | 含义 |
+| --- | --- |
+| `timestamp`、`level`、`event` | UTC 时间、日志级别和事件名称，每条日志都包含。 |
+| `request_id` | 服务端为每次 HTTP 请求生成的 ID；服务启动/停止事件为 `null`。 |
+| `thread_id` | 对话线程 ID，由请求提供或由服务生成；使用非敏感标识。 |
+| `span_id`、`parent_span_id` | 模型或工具调用的 ID；开始事件还记录框架提供的上级调用 ID。 |
+| `duration_ms` | 结束事件中的耗时，单位为毫秒。HTTP 耗时表示后端请求处理时间，不包含完整网络传输时间。 |
+| `tool_name` | 工具名称，工具开始和结束事件都包含。 |
+| `error_code`、`error_type`、`stack` | 已知 API 错误码、异常类型和异常调用位置；按事件提供。 |
+| `input_tokens`、`output_tokens`、`total_tokens` | 模型供应商提供时记录的数字 token 用量。 |
+
+示例日志（字段值仅作说明）：
 
 ```json
 {"timestamp":"2026-10-06T12:00:00+00:00","level":"INFO","event":"chat.completed","request_id":"abc123","thread_id":"demo","duration_ms":125.4,"review_count":1}
 ```
 
-应用事件不记录请求/响应正文、提示词、草稿、审查意见、工具参数/结果、密钥或上游异常正文。
-Uvicorn 与第三方 SDK 的日志是独立来源，不由此 JSON formatter 接管；不要为真实业务开启会输出
-完整 HTTP 请求/响应的 SDK debug 日志，宿主收集未捕获异常回溯时也需要检查其中的敏感内容。
+### 事件与排错
 
-独立运行日志检查（使用真实 Uvicorn HTTP 请求和工具，不调用模型供应商）：
+| 事件 | 用途 |
+| --- | --- |
+| `service.started/stopped` | 服务生命周期。启动记录模型名、工具数量和图步数上限。 |
+| `http.started/completed` | HTTP 请求及其处理结果。结束记录方法、路由模板、状态码和耗时；未知路径使用 `<unmatched>`。 |
+| `chat.started/completed/failed` | 对话开始、完成或已知错误。完成记录审查轮数，失败记录 API 错误码。 |
+| `llm.started/completed/failed` | 一次逻辑模型调用及其耗时、token 用量或异常位置；SDK 内部网络重试包含在该调用中。 |
+| `tool.started/completed/failed` | 工具执行结果和耗时。ToolNode 将异常转换为错误结果时也记录为失败，`outcome=error_result`。 |
+| `review.completed` | 有效审查结论和轮数。`verdict=PASS` 表示模型接受回答，`REVISE` 表示需要修改；结论不保证回答正确。 |
+| `review.format_retry/format_failed` | 审查格式不合法时的补问与最终失败。 |
+| `review.limit_reached` | WARNING：达到审查次数上限，按业务规则提交当前回答；此时仍可能是 REVISE。 |
+| `http.failed/cancelled` | 未映射异常或请求任务取消。取消对应的 499 仅作为日志诊断标记。 |
+
+请求结束时仍未收到完成回调的模型或工具调用记录为失败，`outcome=interrupted`。
+例如，取消请求可能跳过框架的结束回调。该字段表示调用记录未完整结束。
+
+排错时查找出错响应的 `X-Request-ID`，定位同 ID 的 `chat.failed`、`llm.failed`、`tool.failed` 或 `http.failed`。
+未预期异常可能由服务器直接生成响应，响应头不保证包含该 ID，此时从日志中的时间和请求记录定位。
+已知错误码对应以下检查位置：
+
+| 错误码 | HTTP 状态 | 检查位置 |
+| --- | --- | --- |
+| `missing_api_key` | 503 | `.env` 的模型密钥配置。 |
+| `upstream_timeout` | 504 | 模型接口耗时和 `LLM_TIMEOUT_SECONDS`。 |
+| `upstream_error` | 502 | 模型服务连接、认证和调用配置；关联 `llm.failed` 查看异常类型及代码位置。 |
+| `review_output_invalid` | 502 | 审查输出协议，以及 `review.format_retry/format_failed` 事件。 |
+| `step_limit_reached` | 500 | 图执行流程和 `PROMETHEUS_MAX_STEPS`。 |
+
+### 新增工具和业务事件
+
+通过 LangChain 工具机制注册到 `TOOLS`、由当前图执行的工具，会自动触发 `RuntimeLogCallback`，
+通常不需要修改日志模块。通过普通 Python 调用直接执行的函数，需要在其执行入口接入记录。
+
+需要记录业务自己掌握的结果时，调用 `log_event()`。例如，文档解析完成处可采用以下写法：
+
+```python
+from app.runtime_logging import log_event
+
+log_event('document.parsed', page_count=12)
+```
+
+示例中的页数仅作说明，实际使用解析结果。业务位置提供事件名和必要字段；
+JSON 格式、输出方式和调用计时集中在 `app/runtime_logging.py`，HTTP 请求记录集中在 `app/main.py`。
+调整日志保存方式应修改输出配置或采集配置。
+
+### 敏感信息与保存范围
+
+应用事件不记录请求/响应正文、提示词、草稿、审查意见、工具参数/结果、密钥或上游异常正文。
+异常只记录类型和代码位置，省略局部变量。新增业务事件也需要遵守这个字段范围。
+Uvicorn 与第三方 SDK 的日志独立于此 JSON formatter；启用完整 HTTP debug 输出或收集服务器异常回溯时，
+需要检查其中的敏感内容。
+
+Databricks Apps 可以采集部署进程的 stdout/stderr，在应用 Logs 页面展示。
+默认 Logs 页面在应用计算资源关闭后不保留日志；长期保存需要额外配置平台采集与持久存储。
+当前代码没有配置 Databricks 持久化或 LangSmith。平台接入时需确认自定义应用日志实际进入保存位置。
+参考 [Apps 日志说明](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/monitor) 和
+[App Telemetry 配置](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/observability)。
+
+当前记录单次耗时，p95/p99 需要在保存的日志或监控系统中汇总计算。
+日志测试产生的 `.runtime/` 文件是检查产物，已由 `.gitignore` 忽略。
+
+### 验证日志
+
+运行真实 Uvicorn HTTP 请求和真实工具检查：
 
 ```bash
 uv run --locked pytest tests/test_runtime_logging.py -q
 ```
 
-验证 `.env` 中配置的真实模型时，设置 `PROMETHEUS_LIVE_LOG_TEST=1` 后运行相同命令。
-该测试执行一次真实对话及其 Reflection，会产生供应商用量费用。默认跳过。
+默认跳过真实模型测试。填写 `.env` 后，可在 PowerShell 显式开启：
+
+```powershell
+$env:PROMETHEUS_LIVE_LOG_TEST = '1'
+uv run --locked pytest tests/test_runtime_logging.py -q
+Remove-Item Env:PROMETHEUS_LIVE_LOG_TEST
+```
+
+真实模型测试执行一次对话及其 Reflection，会产生供应商用量费用。
 
 ## 代码结构
 
