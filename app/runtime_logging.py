@@ -3,7 +3,7 @@ import logging
 import sys
 import traceback
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any
 from uuid import UUID
@@ -22,7 +22,7 @@ class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         check_fields = {'check_request_id': check_request_id_context.get()} if check_request_id_context.get() else {}
         return json.dumps({
-            'timestamp': datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
+            'timestamp': datetime.fromtimestamp(record.created, UTC).isoformat(),
             'level': record.levelname,
             'event': record.getMessage(),
             'request_id': request_id_context.get(),
