@@ -216,3 +216,9 @@ checkpointer 保存 State 的快照，包括草稿和审查字段；中间快照
 `recursion_limit` 是调用配置中的图执行步数上限，不是 State 或 checkpoint 定位字段。默认值为 20；没有工具调用时，首次审查通过至少需要 3，完整执行 3 次审查至少需要 7，工具循环还会消耗额外步数。格式补问发生在同一个 `reflect` 节点内，不消耗额外图步数。较低的自定义上限可能让本轮在完成审查前以 `step_limit_reached` 结束。
 
 当前没有独立的 saver 创建逻辑；实际接入记忆时，再用 `app/agent/checkpointer.py` 集中管理后端及 saver 的创建、复用和关闭。
+
+## Coding 计算核查子 Agent
+
+通过 `app.agent.coding.run_check` 接收结构化核查任务，基于授权 CSV/JSON 数据执行 Python，返回结论与证据。接口仍为本地草案，需要与 Review Agent 双方确认。真实 Docker 容器与真实模型的核查测试已在 Linux 上通过。
+
+主 Agent 需要通过工具选择计算核查时，使用 `make_check_tool(authorized_files=...)` 创建本次审核专用的 LangChain 工具，再传给主 Agent 的工具列表。授权文件映射由后台提供，模型只提交 `CheckRequest` 字段。该工具返回完整 `CheckResult`；固定审核节点可以直接调用 `run_check`。当前聊天服务尚未注册此工具。

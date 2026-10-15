@@ -14,17 +14,20 @@ from langchain_core.outputs import LLMResult
 # ContextVar keeps correlation IDs isolated between concurrent requests.
 request_id_context: ContextVar[str | None] = ContextVar('request_id', default=None)
 thread_id_context: ContextVar[str | None] = ContextVar('thread_id', default=None)
+check_request_id_context: ContextVar[str | None] = ContextVar('check_request_id', default=None)
 logger = logging.getLogger('prometheus')
 
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
+        check_fields = {'check_request_id': check_request_id_context.get()} if check_request_id_context.get() else {}
         return json.dumps({
             'timestamp': datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
             'level': record.levelname,
             'event': record.getMessage(),
             'request_id': request_id_context.get(),
             'thread_id': thread_id_context.get(),
+            **check_fields,
             **getattr(record, 'event_fields', {}),
         }, ensure_ascii=False)
 
