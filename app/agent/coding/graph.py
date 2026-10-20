@@ -109,9 +109,10 @@ def build_check_graph(model: BaseChatModel, sandbox: Sandbox) -> CompiledStateGr
         if not response.tool_calls:
             return {'messages': [*messages, HumanMessage(REMINDER)]}
         result = None
+        alone = len(response.tool_calls) + len(response.invalid_tool_calls) == 1
         for call in response.tool_calls:
             try:
-                content, finding = await execute(call, alone=len(response.tool_calls) == 1)
+                content, finding = await execute(call, alone=alone)
             except ValidationError as error:
                 problems = error.errors(include_url=False, include_input=False, include_context=False)
                 messages.append(ToolMessage(content=f'Error: invalid arguments {json.dumps(problems)}',

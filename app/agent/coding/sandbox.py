@@ -10,7 +10,7 @@ from uuid import uuid4
 from app.agent.coding.limits import INSPECTION_BYTES, MAX_EXECUTIONS
 from app.agent.coding.schemas import CheckFailure, CheckRequest, Execution
 from app.agent.coding.staging import remove_staging, stage_inputs, staged_name
-from app.runtime_logging import log_event
+from app.runtime_logging import exception_fields, log_event
 
 
 class ExecutionBackend(Protocol):
@@ -42,6 +42,7 @@ class Sandbox:
                       for index, ref in enumerate(request.data_refs)}
         self.executions: list[Execution] = []
         self.inspected: set[str] = set()
+        self.staging: asyncio.Task | None = None
         self.started = False
 
     def remaining(self) -> float:
@@ -54,7 +55,9 @@ class Sandbox:
         if self.started:
             return
         self.remaining()
-        await asyncio.to_thread(stage_inputs, self.request, self.files, self.directory)
+        # 取消只会停止等待，复制线程仍会继续运行；close() 等它结束后再删除目录。
+        self.staging = asyncio.create_task(asyncio.to_thread(stage_inputs, self.request, self.files, self.directory))
+        await asyncio.shield(self.staging)
         await self.backend.start(self.directory, timeout=self.remaining())
         self.started = True
 
@@ -94,6 +97,9 @@ class Sandbox:
                       output_truncated=execution.output_truncated)
 
     async def close(self) -> None:
+        if self.staging is not None:
+            # 复制失败的原因已经由 start() 报告，这里只等待线程结束。
+            await asyncio.gather(self.staging, return_exceptions=True)
         await self.backend.close()
         await asyncio.to_thread(remove_staging, self.directory, self.staging_root)
 
@@ -104,9 +110,13 @@ async def close_safely(sandbox: Sandbox) -> None:
     cancelled = False
     while not cleanup.done():
         try:
-            await asyncio.shield(cleanup)
+            # wait() 被取消时不会取消 cleanup，也不会抛出 cleanup 的异常。
+            await asyncio.wait([cleanup])
         except asyncio.CancelledError:
             cancelled = True
-    cleanup.result()
     if cancelled:
+        # 清理失败时仍然传播取消，失败原因写入日志。
+        if cleanup.exception() is not None:
+            log_event('check.cleanup_failed', level=logging.ERROR, **exception_fields(cleanup.exception()))
         raise asyncio.CancelledError
+    cleanup.result()

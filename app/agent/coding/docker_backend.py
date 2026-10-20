@@ -11,11 +11,10 @@ NAME_PREFIX = 'pierre-check-'
 OWNER_LABEL = 'pierre.coding.owner'
 OWNER = 'prometheus-local-v1'
 EXPIRY_LABEL = 'pierre.coding.expires'
-# Exit codes from docker exec itself or a killed container, never from user code.
-UNAVAILABLE_EXIT_CODES = (125, 126, 127, 137)
-_initialized = False
-_initialization_lock: asyncio.Lock | None = None
-_initialization_loop = None
+# 正常任务到期后会自己删除容器；留出这段时间，避免回收和它同时删除同一个容器。
+EXPIRY_GRACE_S = 60
+_cleanup_lock: asyncio.Lock | None = None
+_cleanup_loop = None
 
 
 async def docker_command(*args: str, timeout: float = 10, input_bytes: bytes | None = None,
@@ -83,32 +82,26 @@ async def require_docker(*args: str, timeout: float = 10) -> str:
 
 
 async def cleanup_expired(staging_root: Path) -> None:
-    listing = await require_docker('ps', '-a', '--filter', f'label={OWNER_LABEL}={OWNER}',
-                                   '--format', '{{.Names}}\t{{.Label "' + EXPIRY_LABEL + '"}}')
-    rows = [line.split('\t') for line in listing.splitlines()]
-    expired = [name for name, expiry in rows if expiry and float(expiry) <= time.time()]
-    if not expired:
-        return
-    await require_docker('rm', '-f', *expired)
-    for name in expired:
-        log_event('sandbox.expired_removed', container_id=name)
-        # Only remove a directory derived from our generated container name.
-        identifier = name.removeprefix(NAME_PREFIX)
-        if len(identifier) == 32 and all(character in '0123456789abcdef' for character in identifier):
-            await asyncio.to_thread(remove_staging, staging_root / identifier, staging_root)
-
-
-async def initialize(staging_root: Path) -> None:
-    # Reclaim containers left by a crashed process once per process, before the first task.
-    global _initialized, _initialization_lock, _initialization_loop
+    # 回收异常退出的进程留下的容器。每次新建容器前都会运行，服务重启时尚未到期的遗留容器由之后的任务回收。
+    global _cleanup_lock, _cleanup_loop
     loop = asyncio.get_running_loop()
-    if _initialization_loop is not loop:
-        _initialization_lock = asyncio.Lock()
-        _initialization_loop = loop
-    async with _initialization_lock:
-        if not _initialized:
-            await cleanup_expired(staging_root)
-            _initialized = True
+    if _cleanup_loop is not loop:
+        _cleanup_lock = asyncio.Lock()
+        _cleanup_loop = loop
+    async with _cleanup_lock:
+        listing = await require_docker('ps', '-a', '--filter', f'label={OWNER_LABEL}={OWNER}',
+                                       '--format', '{{.Names}}\t{{.Label "' + EXPIRY_LABEL + '"}}')
+        rows = [line.split('\t') for line in listing.splitlines()]
+        expired = [name for name, expiry in rows if expiry and float(expiry) + EXPIRY_GRACE_S <= time.time()]
+        if not expired:
+            return
+        await require_docker('rm', '-f', *expired)
+        for name in expired:
+            log_event('sandbox.expired_removed', container_id=name)
+            # Only remove a directory derived from our generated container name.
+            identifier = name.removeprefix(NAME_PREFIX)
+            if len(identifier) == 32 and all(character in '0123456789abcdef' for character in identifier):
+                await asyncio.to_thread(remove_staging, staging_root / identifier, staging_root)
 
 
 class DockerBackend:
@@ -121,7 +114,7 @@ class DockerBackend:
         self.name: str | None = None
 
     async def start(self, input_dir: Path, timeout: float) -> None:
-        await initialize(input_dir.parent)
+        await cleanup_expired(input_dir.parent)
         self.name = f'{NAME_PREFIX}{input_dir.name}'
         await require_docker(
             'run', '--detach', '--name', self.name, '--pull=never', '--network=none', '--read-only',
@@ -143,8 +136,13 @@ class DockerBackend:
     async def run_code(self, code: str, execution: Execution, timeout: float) -> None:
         await docker_command('exec', '-i', self.name, 'python', '-', timeout=timeout,
                              input_bytes=code.encode('utf-8'), capture=execution)
-        if execution.exit_code in UNAVAILABLE_EXIT_CODES:
+        # docker exec 会原样返回用户程序的退出码；只有容器已经停止时才是环境故障。
+        if execution.exit_code != 0 and not await self.running():
             raise CheckFailure('environment_error', 'The sandbox execution was unavailable or terminated.')
+
+    async def running(self) -> bool:
+        code, stdout, _ = await docker_command('inspect', '--format', '{{.State.Running}}', self.name)
+        return code == 0 and stdout.strip() == 'true'
 
     async def close(self) -> None:
         if self.name is None:

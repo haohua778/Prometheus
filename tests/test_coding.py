@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from app.agent.coding import CheckRequest, make_check_tool, run_check
 from app.agent.coding.agent import service_slots
 from app.agent.coding.docker_backend import (
+    EXPIRY_GRACE_S,
     EXPIRY_LABEL,
     NAME_PREFIX,
     OWNER,
@@ -261,18 +262,22 @@ def test_graph_returns_correctable_errors_to_the_model(settings):
                 invalid_tool_calls=[{'name': RUN_CODE, 'args': '{', 'id': 'broken', 'error': None}]),
             make_tool_call_message(SUBMIT_FINDING, {'verdict': 'supports', 'explanation': 'No run', 'evidence': []},
                                    'unsupported'),
+            AIMessage(content='', tool_calls=[{'name': SUBMIT_FINDING, 'args': INCONCLUSIVE, 'id': 'submit-with-broken'}],
+                      invalid_tool_calls=[{'name': RUN_CODE, 'args': '{', 'id': 'broken-again', 'error': None}]),
             make_tool_call_message(SUBMIT_FINDING, INCONCLUSIVE, 'final'),
         ])
         sandbox = sandbox_for(request_for(data_refs=[]), {}, settings)
         output = await build_check_graph(model, sandbox).ainvoke(
             {'messages': [HumanMessage('check')], 'model_calls': 0, 'result': None})
         assert output['result'].verdict == 'inconclusive'
-        assert output['model_calls'] == 4
+        assert output['model_calls'] == 5
         assert isinstance(output['messages'][2], HumanMessage) and output['messages'][2].text == REMINDER
         errors = {message.tool_call_id: message.text for message in output['messages']
                   if isinstance(message, ToolMessage) and message.status == 'error'}
-        assert set(errors) == {'broken', 'unknown', 'mixed-submit', 'unsupported'}
+        assert set(errors) == {'broken', 'unknown', 'mixed-submit', 'unsupported', 'submit-with-broken',
+                               'broken-again'}
         assert 'not valid JSON' in errors['broken'] and 'alone' in errors['mixed-submit']
+        assert 'alone' in errors['submit-with-broken']
         assert 'successful' in errors['unsupported']
         assert not sandbox.started
     asyncio.run(scenario())
@@ -348,6 +353,42 @@ def test_cleanup_rejects_a_dangling_staging_link(tmp_path, settings):
             sandbox.directory.unlink()
         assert not target.exists()
     asyncio.run(scenario(tmp_path / 'nonexistent'))
+
+
+def test_cancellation_survives_a_cleanup_failure(tmp_path, settings):
+    async def scenario(target):
+        sandbox = sandbox_for(request_for(data_refs=[]), {}, settings)
+        settings.coding_staging_dir.mkdir(parents=True)
+        sandbox.directory.symlink_to(target, target_is_directory=True)
+        try:
+            closing = asyncio.create_task(close_safely(sandbox))
+            await asyncio.sleep(0)
+            closing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await closing
+        finally:
+            sandbox.directory.unlink()
+    asyncio.run(scenario(tmp_path / 'nonexistent'))
+
+
+def test_cancelled_staging_leaves_no_copy(tmp_path, settings):
+    async def scenario():
+        files = {}
+        for index in range(5):
+            files[str(index)] = tmp_path / f'{index}.csv'
+            with files[str(index)].open('wb') as stream:
+                stream.truncate(MAX_FILE_BYTES)
+        request = request_for(data_refs=[{'file_id': file_id, 'format': 'csv'} for file_id in files])
+        sandbox = sandbox_for(request, files, settings)
+        starting = asyncio.create_task(sandbox.start())
+        await asyncio.sleep(0)
+        starting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await starting
+        await close_safely(sandbox)
+        assert sandbox.staging.done()
+        assert not sandbox.directory.exists()
+    asyncio.run(scenario())
 
 
 def test_queued_request_is_an_independent_snapshot(model, settings):
@@ -543,21 +584,71 @@ def test_real_concurrent_containers_and_json(tmp_path, settings):
 
 
 @docker_test
+@pytest.mark.parametrize('exit_code', [125, 126, 127, 137])
+def test_real_program_exit_codes_stay_correctable(settings, exit_code):
+    async def scenario():
+        sandbox = sandbox_for(request_for(data_refs=[]), {}, settings)
+        try:
+            execution = await sandbox.run_code(f'raise SystemExit({exit_code})')
+            assert execution.exit_code == exit_code
+        finally:
+            await close_safely(sandbox)
+    asyncio.run(scenario())
+
+
+@docker_test
+def test_real_stopped_container_is_an_environment_error(settings):
+    async def scenario():
+        sandbox = sandbox_for(request_for(data_refs=[]), {}, settings)
+        try:
+            await sandbox.start()
+            await require_docker('kill', sandbox.backend.name)
+            with pytest.raises(CheckFailure) as error:
+                await sandbox.run_code('print(1)')
+            assert error.value.code == 'environment_error'
+        finally:
+            await close_safely(sandbox)
+    asyncio.run(scenario())
+
+
+@docker_test
 def test_real_expired_container_cleanup(settings):
     async def scenario():
+        # 先完成一次任务，确认之后新建的任务仍会回收过期容器。
+        earlier = sandbox_for(request_for(data_refs=[]), {}, settings)
+        try:
+            await earlier.start()
+        finally:
+            await close_safely(earlier)
         identifier = uuid4().hex
         name = f'{NAME_PREFIX}{identifier}'
         directory = settings.coding_staging_dir / identifier
         directory.mkdir(parents=True)
         await require_docker('create', '--name', name, '--label', f'{OWNER_LABEL}={OWNER}',
-                             '--label', f'{EXPIRY_LABEL}={time.time() - 1}', settings.coding_image)
+                             '--label', f'{EXPIRY_LABEL}={time.time() - EXPIRY_GRACE_S - 1}', settings.coding_image)
+        later = sandbox_for(request_for(data_refs=[]), {}, settings)
         try:
-            await cleanup_expired(settings.coding_staging_dir)
+            await later.start()
             assert name not in await container_names()
             assert not directory.exists()
         finally:
+            await close_safely(later)
             if name in await container_names():
                 await require_docker('rm', '-f', name)
+    asyncio.run(scenario())
+
+
+@docker_test
+def test_real_cleanup_keeps_containers_within_the_grace_period(settings):
+    async def scenario():
+        name = f'{NAME_PREFIX}{uuid4().hex}'
+        await require_docker('create', '--name', name, '--label', f'{OWNER_LABEL}={OWNER}',
+                             '--label', f'{EXPIRY_LABEL}={time.time() - 1}', settings.coding_image)
+        try:
+            await cleanup_expired(settings.coding_staging_dir)
+            assert name in await container_names()
+        finally:
+            await require_docker('rm', '-f', name)
     asyncio.run(scenario())
 
 

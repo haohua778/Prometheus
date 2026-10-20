@@ -16,9 +16,9 @@ The owner approved a Python internal entry point and CSV/JSON inputs. Docker-dep
 - FR-1: The module MUST expose async run_check(CheckRequest, authorized_files=..., model=..., settings=...) returning CheckResult.
 - FR-2: Requests MUST identify the claim, question and authorized file IDs; invalid inputs MUST fail before model execution.
 - FR-3: Each call MUST use independent messages, execution records, callback state and sandbox resources, with no persistent graph checkpoints.
-- FR-4: The agent MUST use sequential inspect_data and run_code tools; each code execution MUST start a fresh Python process. The model MUST return its result by calling submit_finding alone.
+- FR-4: The agent MUST use sequential inspect_data and run_code tools; each code execution MUST start a fresh Python process. The model MUST return its result by calling submit_finding alone; calls with unparseable arguments count toward this rule.
 - FR-5: supports/refutes MUST require inspected authorized evidence and a successful, non-truncated code execution. A submitted result that breaks these rules MUST return to the model as a tool error for correction. Missing evidence MUST return inconclusive. Returned status, verdict and error_code MUST be consistent; failed checks MUST carry an error code.
-- FR-6: Success, failure, timeout and cancellation MUST clean task resources; cancellation MUST propagate.
+- FR-6: Success, failure, timeout and cancellation MUST clean task resources, waiting for any input copy still in progress; cancellation MUST propagate, including when cleanup fails.
 - FR-7: The module MUST preserve parent request correlation and MUST NOT log raw code, data or output to application stdout logs.
 
 ## Non-Functional Requirements
@@ -44,7 +44,7 @@ Given known CSV/JSON records, When real code executes, Then arithmetic results a
 Given infinite loops, cancellation or output overflow, When execution ends, Then task containers and staged files are removed.
 
 ### AC-5: Expiry (FR-6)
-Given an expired owner-labeled container, When initialization cleans it, Then the container and its generated staging directory are removed.
+Given an owner-labeled container whose expiry passed more than the grace period ago, When any later task creates its container, Then the expired container and its generated staging directory are removed; containers still within the grace period are kept.
 
 ### AC-6: Real model (FR-5)
 Given real model tasks with supported, contradicted or missing-period evidence, When the graph completes, Then the verdict and cited file IDs match the case.
@@ -57,11 +57,11 @@ Given a real task container, When inspected and exercised, Then resource setting
 
 ## Edge Cases
 
-- EC-1: Docker unavailable, missing image or unexpected container termination: explicit environment_error, no fake execution.
+- EC-1: Docker unavailable, missing image or unexpected container termination: explicit environment_error, no fake execution. A nonzero exit code while the task container is still running belongs to the generated program and returns to the model for correction.
 - EC-2: Model API failure: model_error. A missing key fails when the caller builds the model, before run_check. Invalid or unsupported submit_finding arguments return to the model as tool errors; a model that never submits a valid result ends with budget_exhausted.
 - EC-3: Malformed UTF-8 CSV/JSON or excessive preview: data_invalid/output_limit, inconclusive.
 - EC-4: Cleanup failure: failed/inconclusive and cleanup_failed; log and retain diagnostic identifiers.
-- EC-5: Service crash: no graph recovery; expired task containers are reclaimed at the next runtime initialization.
+- EC-5: Service crash: no graph recovery; expired task containers are reclaimed before each new task container starts.
 
 ## API Contracts
 
