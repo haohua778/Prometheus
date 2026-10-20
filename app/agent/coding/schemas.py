@@ -9,10 +9,12 @@ from pydantic import (
     model_validator,
 )
 
+from app.agent.coding.limits import MAX_CODE_CHARS, MAX_FILES, MAX_TIMEOUT_S
+
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 FileId = Annotated[str, StringConstraints(pattern=r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')]
 ErrorCode = Literal['data_invalid', 'timeout', 'budget_exhausted', 'output_limit',
-                    'environment_error', 'model_error', 'result_invalid', 'cleanup_failed']
+                    'environment_error', 'model_error', 'cleanup_failed']
 
 
 def failure_status(code: ErrorCode) -> Literal['incomplete', 'failed']:
@@ -33,8 +35,8 @@ class CheckRequest(Contract):
     flag_id: Text
     claim: Text
     question: Text
-    data_refs: list[DataRef] = Field(max_length=5)
-    timeout_s: int = Field(default=60, ge=1, le=60)
+    data_refs: list[DataRef] = Field(max_length=MAX_FILES)
+    timeout_s: int = Field(default=MAX_TIMEOUT_S, ge=1, le=MAX_TIMEOUT_S)
 
     @model_validator(mode='after')
     def unique_files(self):
@@ -99,4 +101,4 @@ class InspectArgs(Contract):
 
 
 class RunArgs(Contract):
-    code: Text = Field(max_length=32768)
+    code: Text = Field(max_length=MAX_CODE_CHARS)

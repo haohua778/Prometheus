@@ -7,6 +7,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import Field
 
 from app.config import Settings
@@ -24,7 +25,7 @@ class ScriptedChatModel(BaseChatModel):
         return 'scripted'
 
     def bind_tools(self, tools: list[Any], **kwargs: Any) -> 'ScriptedChatModel':
-        self.bound_tool_names = [tool.name for tool in tools]
+        self.bound_tool_names = [convert_to_openai_tool(tool)['function']['name'] for tool in tools]
         return self
 
     def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None,

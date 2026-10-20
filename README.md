@@ -219,6 +219,10 @@ checkpointer 保存 State 的快照，包括草稿和审查字段；中间快照
 
 ## Coding 计算核查子 Agent
 
-通过 `app.agent.coding.run_check` 接收结构化核查任务，基于授权 CSV/JSON 数据执行 Python，返回结论与证据。接口仍为本地草案，需要与 Review Agent 双方确认。真实 Docker 容器与真实模型的核查测试已在 Linux 上通过。
+通过 `app.agent.coding.run_check` 接收结构化核查任务，基于授权 CSV/JSON 数据执行 Python，返回结论与证据。接口仍为本地草案，需要与 Review Agent 双方确认。各模块的职责和完整接口见根目录的 `coding-spec.md`。
 
-主 Agent 需要通过工具选择计算核查时，使用 `make_check_tool(authorized_files=...)` 创建本次审核专用的 LangChain 工具，再传给主 Agent 的工具列表。授权文件映射由后台提供，模型只提交 `CheckRequest` 字段。该工具返回完整 `CheckResult`；固定审核节点可以直接调用 `run_check`。当前聊天服务尚未注册此工具。
+主 Agent 需要通过工具选择计算核查时，使用 `make_check_tool(authorized_files=..., model=..., settings=...)` 创建本次审核专用的 LangChain 工具，再传给主 Agent 的工具列表。模型由调用方用 `build_chat_model` 创建后传入。授权文件映射由后台提供，模型只提交 `CheckRequest` 字段。该工具返回完整 `CheckResult`；固定审核节点可以直接调用 `run_check`。当前聊天服务尚未注册此工具。
+
+运行前先构建沙箱镜像：`docker build -t pierre-coding:local sandbox`。核查时输入文件会复制到中转目录，默认是项目内的 `.runtime/coding`；部署环境的源代码目录只读时，用 `PROMETHEUS_CODING_STAGING_DIR` 指定一个可写目录。镜像名称可以用 `PROMETHEUS_CODING_IMAGE` 修改。
+
+真实 Docker 和真实模型测试需要显式开启：`PROMETHEUS_DOCKER_TEST=1` 和 `PROMETHEUS_LIVE_CODING_TEST=1`。

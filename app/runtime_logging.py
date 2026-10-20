@@ -20,7 +20,8 @@ logger = logging.getLogger('prometheus')
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        check_fields = {'check_request_id': check_request_id_context.get()} if check_request_id_context.get() else {}
+        check_request_id = check_request_id_context.get()
+        check_fields = {'check_request_id': check_request_id} if check_request_id else {}
         return json.dumps({
             'timestamp': datetime.fromtimestamp(record.created, UTC).isoformat(),
             'level': record.levelname,

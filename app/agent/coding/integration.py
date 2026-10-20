@@ -1,21 +1,21 @@
 from collections.abc import Mapping
 from pathlib import Path
 
+from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import StructuredTool
 
 from app.agent.coding.agent import run_check
-from app.agent.coding.schemas import CheckRequest, DataRef
+from app.agent.coding.schemas import CheckRequest
+from app.config import Settings
 
 
-def make_check_tool(*, authorized_files: Mapping[str, Path]) -> StructuredTool:
+def make_check_tool(*, authorized_files: Mapping[str, Path], model: BaseChatModel,
+                    settings: Settings) -> StructuredTool:
     # Capture only this review's authorization; callers may reuse their mapping.
     files = dict(authorized_files)
 
-    async def check_claim(request_id: str, flag_id: str, claim: str, question: str,
-                          data_refs: list[DataRef], timeout_s: int = 60) -> dict:
-        request = CheckRequest(request_id=request_id, flag_id=flag_id, claim=claim,
-                               question=question, data_refs=data_refs, timeout_s=timeout_s)
-        result = await run_check(request, authorized_files=files)
+    async def check_claim(**fields) -> dict:
+        result = await run_check(CheckRequest(**fields), authorized_files=files, model=model, settings=settings)
         return result.model_dump(mode='json')
 
     return StructuredTool.from_function(

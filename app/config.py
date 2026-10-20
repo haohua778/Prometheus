@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     max_steps: int = Field(default=20, ge=3, le=50, validation_alias=AliasChoices('PROMETHEUS_MAX_STEPS'))
     log_level: Literal['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'] = Field(
         default='INFO', validation_alias='PROMETHEUS_LOG_LEVEL')
+    # Computational checks copy inputs here; deployments with a read-only source tree set a writable path.
+    coding_staging_dir: Path = Field(default=PROJECT_ROOT / '.runtime' / 'coding',
+                                     validation_alias='PROMETHEUS_CODING_STAGING_DIR')
+    coding_image: str = Field(default='pierre-coding:local', validation_alias='PROMETHEUS_CODING_IMAGE')
 
 
 @lru_cache(maxsize=1)
