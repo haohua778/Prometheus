@@ -106,12 +106,17 @@ PROMETHEUS_DOCKER_TEST=1 PROMETHEUS_LIVE_CODING_TEST=1 uv run --locked pytest -q
 
 ## 测试状态
 
-- 2026-10-20 在 Windows 上运行离线测试：128 个通过，17 个跳过。跳过的是 Docker 测试、真实模型测试和一个真实日志测试。
-- 真实 Docker 和真实模型测试上一次全部通过是 2026-10-15，在 Linux 上，那时的代码还没有经过模块拆分和之后的修复。拆分和修复之后，这两组测试还没有重新运行。新增的 Docker 测试覆盖：用户程序退出码交回模型、容器停止报环境故障、过期容器回收、60 秒等待期内的容器保留。
+- 2026-10-20 在 Linux 上运行全部测试，打开真实 Docker、真实模型核查和真实日志三组开关：145 个通过，没有失败和跳过。测试结束后没有遗留容器，输入副本目录为空。
+- 同一天在 Windows 上运行离线测试：128 个通过，17 个跳过。跳过的是需要打开开关的 Docker 测试、真实模型测试和一个真实日志测试。
+- Docker 测试覆盖：真实容器中的计算、文件权限、并发、超时、取消、输出超限、用户程序退出码交回模型、容器停止报环境故障、过期容器回收、60 秒等待期内的容器保留。
 
 ## 已知问题
 
-- **Databricks Apps 大概率不能运行 Docker。** 本地 Docker 后端适合开发和测试，部署到 Databricks 需要另写执行后端。候选方案见项目上一级目录 `docs/Coding子Agent沙箱方案调研.md`，需要平台负责人确认。
+- **Databricks Apps 大概率不能运行 Docker。** 本地 Docker 后端适合开发和测试，部署到 Databricks 需要另写执行后端。目前的候选方案如下，需要平台负责人确认：
+  - Databricks 自带的代码执行服务 `system.ai.sandbox`：没有外网，有权限控制和调用记录；属于 Unity Gateway Beta，需要账户管理员开启，我们现在的账户用不了。
+  - 在 SQL Warehouse 上运行的 Unity Catalog Python 函数：数据留在 Databricks 内；它为 SQL 查询设计，用来运行整段代码时，超时和输出上限都要在函数里自己实现，数据也只能作为参数传入。
+  - Monty（Pydantic 的 Python 解释器）：直接在 App 里运行，代码接触不到文件、网络和环境变量；只支持部分 Python，不能用 pandas。
+  - Azure Container Apps 动态会话：虚拟机级隔离，支持上传文件；数据会离开 Databricks，需要安全团队同意。
 - **容器内的 Python 没有使用隔离模式。** 镜像设置了 `HOME=/work`，模型代码可以在 `/work/.local/` 下写入 `usercustomize.py`，同一容器之后启动的 Python 进程都会先执行它，其中也包括数据检查脚本。影响范围只在单次核查的容器内部，修复方法是在 `docker_backend.py` 的两条 `python` 命令里加 `-I` 参数。这条结论根据 Python 的启动机制推断，还没有在真实 Docker 里复现。
 - **证据和运行结果之间没有自动对照。** 系统只检查"至少有一次成功的运行"，不检查证据里的数值是否来自那次运行的输出。结论是否算对，依靠提示词和真实模型测试。
 - **模型客户端和事件循环。** langchain-openai 在进程内缓存一个异步 HTTP 客户端，连接属于创建它的事件循环。uvicorn 只有一个事件循环，不受影响。如果上层框架每次交互都调用 `asyncio.run()`（例如 Streamlit），第二次核查会报 `Event loop is closed`。
