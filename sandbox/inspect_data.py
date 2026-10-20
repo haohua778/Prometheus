@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 def inspect(path: Path, file_format: str, sample_limit: int) -> dict:
+    """Validate a UTF-8 CSV or JSON record file and return its fields, record count and samples."""
     with path.open(encoding='utf-8', newline='') as source:
         if file_format == 'csv':
             reader = csv.DictReader(source)

@@ -614,7 +614,7 @@ def test_real_stopped_container_is_an_environment_error(settings):
 @docker_test
 def test_real_expired_container_cleanup(settings):
     async def scenario():
-        # 先完成一次任务，确认之后新建的任务仍会回收过期容器。
+        # Finish one task first: a later task must still reclaim expired containers.
         earlier = sandbox_for(request_for(data_refs=[]), {}, settings)
         try:
             await earlier.start()

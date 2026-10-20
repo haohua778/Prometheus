@@ -37,6 +37,7 @@ _slots_loop = None
 
 
 def service_slots() -> asyncio.Semaphore:
+    """Return the running loop's semaphore that caps concurrent checks, cleanup included."""
     global _slots, _slots_loop
     loop = asyncio.get_running_loop()
     if _slots_loop is not loop:
@@ -46,6 +47,7 @@ def service_slots() -> asyncio.Semaphore:
 
 
 async def investigate(model: BaseChatModel, sandbox: Sandbox, callbacks: RuntimeLogCallback) -> Finding:
+    """Run the check graph and map graph and model failures to CheckFailure codes."""
     if not sandbox.paths:
         return Finding(verdict='inconclusive', explanation='No supporting data files were supplied.', evidence=[])
     state: CheckState = {'messages': [HumanMessage(sandbox.request.model_dump_json())], 'model_calls': 0, 'result': None}
@@ -62,6 +64,11 @@ async def investigate(model: BaseChatModel, sandbox: Sandbox, callbacks: Runtime
 
 async def run_check(request: CheckRequest, *, authorized_files: Mapping[str, Path],
                     model: BaseChatModel, settings: Settings) -> CheckResult:
+    """Run one computational check: queue for a slot, investigate, clean up and build the result.
+
+    Expected operational failures return an incomplete or failed CheckResult. Request validation
+    errors, cancellation and programming errors propagate, after cleanup once the check has begun.
+    """
     started = perf_counter()
     # Validate and copy the request before any await; the caller may reuse its own object.
     request = CheckRequest.model_validate(request.model_dump())

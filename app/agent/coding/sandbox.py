@@ -46,22 +46,25 @@ class Sandbox:
         self.started = False
 
     def remaining(self) -> float:
+        """Return the seconds left before the deadline; raises timeout once it has passed."""
         remaining = self.deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise CheckFailure('timeout', 'The check exceeded its time budget.')
         return remaining
 
     async def start(self) -> None:
+        """Copy the inputs and start the backend on first use; later calls do nothing."""
         if self.started:
             return
         self.remaining()
-        # 取消只会停止等待，复制线程仍会继续运行；close() 等它结束后再删除目录。
+        # Cancelling stops only the wait: the copy thread keeps running, so close() waits for it.
         self.staging = asyncio.create_task(asyncio.to_thread(stage_inputs, self.request, self.files, self.directory))
         await asyncio.shield(self.staging)
         await self.backend.start(self.directory, timeout=self.remaining())
         self.started = True
 
     async def inspect_data(self, file_id: str) -> dict:
+        """Check one authorized file's format, mark it inspected and return its path, fields and samples."""
         if file_id not in self.paths:
             raise CheckFailure('data_invalid', 'The requested file ID is not authorized for this task.')
         await self.start()
@@ -76,6 +79,7 @@ class Sandbox:
         return {'file_id': file_id, 'path': self.paths[file_id], **json.loads(stdout)}
 
     async def run_code(self, code: str) -> Execution:
+        """Run code in a fresh Python process; the execution is recorded even when it fails or times out."""
         if len(self.executions) >= MAX_EXECUTIONS:
             raise CheckFailure('budget_exhausted', f'At most {MAX_EXECUTIONS} code executions are allowed.')
         # Validate referenced input formats before executing generated code.
@@ -97,25 +101,27 @@ class Sandbox:
                       output_truncated=execution.output_truncated)
 
     async def close(self) -> None:
+        """Release the backend and the task directory; safe when nothing was started."""
         if self.staging is not None:
-            # 复制失败的原因已经由 start() 报告，这里只等待线程结束。
+            # start() already reported any copy failure; here we only wait for the thread to finish.
             await asyncio.gather(self.staging, return_exceptions=True)
         await self.backend.close()
         await asyncio.to_thread(remove_staging, self.directory, self.staging_root)
 
 
 async def close_safely(sandbox: Sandbox) -> None:
+    """Finish cleanup even if the caller is cancelled meanwhile, then re-raise that cancellation."""
     # Cancellation must not strand a running container.
     cleanup = asyncio.create_task(sandbox.close())
     cancelled = False
     while not cleanup.done():
         try:
-            # wait() 被取消时不会取消 cleanup，也不会抛出 cleanup 的异常。
+            # A cancelled wait() neither cancels cleanup nor raises its exception.
             await asyncio.wait([cleanup])
         except asyncio.CancelledError:
             cancelled = True
     if cancelled:
-        # 清理失败时仍然传播取消，失败原因写入日志。
+        # Cancellation still propagates when cleanup fails; the failure is logged.
         if cleanup.exception() is not None:
             log_event('check.cleanup_failed', level=logging.ERROR, **exception_fields(cleanup.exception()))
         raise asyncio.CancelledError

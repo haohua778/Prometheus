@@ -11,7 +11,7 @@ NAME_PREFIX = 'pierre-check-'
 OWNER_LABEL = 'pierre.coding.owner'
 OWNER = 'prometheus-local-v1'
 EXPIRY_LABEL = 'pierre.coding.expires'
-# 正常任务到期后会自己删除容器；留出这段时间，避免回收和它同时删除同一个容器。
+# A task removes its own container at its deadline; waiting this long avoids removing it concurrently.
 EXPIRY_GRACE_S = 60
 _cleanup_lock: asyncio.Lock | None = None
 _cleanup_loop = None
@@ -19,6 +19,11 @@ _cleanup_loop = None
 
 async def docker_command(*args: str, timeout: float = 10, input_bytes: bytes | None = None,
                          capture: Execution | None = None) -> tuple[int, str, str]:
+    """Run a docker CLI command with a timeout and a per-stream output limit.
+
+    With capture, output and exit code are written into that Execution even when the command
+    times out or exceeds the limit. Returns (exit code, stdout, stderr).
+    """
     process = None
     buffers = [bytearray(), bytearray()]
 
@@ -75,6 +80,7 @@ async def docker_command(*args: str, timeout: float = 10, input_bytes: bytes | N
 
 
 async def require_docker(*args: str, timeout: float = 10) -> str:
+    """Run a docker command that must succeed and return its stdout; a failure is environment_error."""
     code, stdout, _ = await docker_command(*args, timeout=timeout)
     if code:
         raise CheckFailure('environment_error', 'Docker operation failed. Check the Docker engine and the sandbox image.')
@@ -82,7 +88,11 @@ async def require_docker(*args: str, timeout: float = 10) -> str:
 
 
 async def cleanup_expired(staging_root: Path) -> None:
-    # 回收异常退出的进程留下的容器。每次新建容器前都会运行，服务重启时尚未到期的遗留容器由之后的任务回收。
+    """Remove expired task containers left by a crashed process, with their staging directories.
+
+    Runs before every new container, so leftovers that had not expired when the service restarted
+    are reclaimed by a later task.
+    """
     global _cleanup_lock, _cleanup_loop
     loop = asyncio.get_running_loop()
     if _cleanup_loop is not loop:
@@ -105,6 +115,7 @@ async def cleanup_expired(staging_root: Path) -> None:
 
 
 class DockerBackend:
+    # ExecutionBackend on the local Docker CLI: one restricted container per check.
     input_root = '/input'
     work_root = '/work'
 
@@ -114,6 +125,7 @@ class DockerBackend:
         self.name: str | None = None
 
     async def start(self, input_dir: Path, timeout: float) -> None:
+        """Create the task container: no network, read-only filesystem and inputs, limited resources."""
         await cleanup_expired(input_dir.parent)
         self.name = f'{NAME_PREFIX}{input_dir.name}'
         await require_docker(
@@ -128,23 +140,27 @@ class DockerBackend:
         log_event('sandbox.created', container_id=self.name, image=self.image)
 
     async def inspect(self, path: str, file_format: str, timeout: float) -> tuple[int, str]:
+        """Run the inspection script; returns its exit code (see sandbox/inspect_data.py) and JSON output."""
         code, stdout, _ = await docker_command(
             'exec', self.name, 'python', '/opt/inspect_data.py', path, file_format,
             str(INSPECTION_BYTES), str(INSPECTION_SAMPLES), timeout=timeout)
         return code, stdout
 
     async def run_code(self, code: str, execution: Execution, timeout: float) -> None:
+        """Pipe code to a fresh python process in the container and record the result in execution."""
         await docker_command('exec', '-i', self.name, 'python', '-', timeout=timeout,
                              input_bytes=code.encode('utf-8'), capture=execution)
-        # docker exec 会原样返回用户程序的退出码；只有容器已经停止时才是环境故障。
+        # docker exec passes the program's exit code through; only a stopped container is an environment error.
         if execution.exit_code != 0 and not await self.running():
             raise CheckFailure('environment_error', 'The sandbox execution was unavailable or terminated.')
 
     async def running(self) -> bool:
+        """Return whether the task container still exists and is running."""
         code, stdout, _ = await docker_command('inspect', '--format', '{{.State.Running}}', self.name)
         return code == 0 and stdout.strip() == 'true'
 
     async def close(self) -> None:
+        """Remove the task container; one that is already gone counts as removed."""
         if self.name is None:
             return
         code, _, stderr = await docker_command('rm', '-f', self.name)

@@ -11,6 +11,7 @@ from app.config import Settings
 
 def make_check_tool(*, authorized_files: Mapping[str, Path], model: BaseChatModel,
                     settings: Settings) -> StructuredTool:
+    """Build the check_claim tool for one review; each call runs an independent run_check."""
     # Capture only this review's authorization; callers may reuse their mapping.
     files = dict(authorized_files)
 

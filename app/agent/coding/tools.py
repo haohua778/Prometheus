@@ -11,12 +11,14 @@ SUBMIT_FINDING = 'submit_finding'
 
 
 def definition(name: str, description: str, schema: type[BaseModel]) -> dict:
+    """Build an OpenAI-format tool whose arguments follow the given pydantic schema."""
     tool = convert_to_openai_tool(schema)
     tool['function'].update(name=name, description=description)
     return tool
 
 
 def tool_definitions(work_root: str) -> list[dict]:
+    """Return the three tools the check model may call; work_root is the backend's writable directory."""
     return [
         definition(INSPECT_DATA, 'Inspect an authorized CSV or JSON attachment. Returns its sandbox path, fields, '
                    f'record count and up to {INSPECTION_SAMPLES} sample records.', InspectArgs),

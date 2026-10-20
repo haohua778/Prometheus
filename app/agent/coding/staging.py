@@ -10,6 +10,7 @@ from app.runtime_logging import log_event
 
 
 def validate_files(request: CheckRequest, authorized_files: Mapping[str, Path]) -> dict[str, Path]:
+    """Map the request's file IDs to authorized regular files within the size limit; raises ValueError."""
     selected = {}
     for ref in request.data_refs:
         if ref.file_id not in authorized_files:
@@ -25,6 +26,7 @@ def validate_files(request: CheckRequest, authorized_files: Mapping[str, Path]) 
 
 
 def staged_name(index: int, file_format: str) -> str:
+    """Name an input copy by position, so original file names never reach the sandbox."""
     return f'{index}.{file_format}'
 
 
@@ -57,6 +59,7 @@ def stage_inputs(request: CheckRequest, authorized_files: Mapping[str, Path], di
 
 
 def remove_staging(directory: Path, root: Path) -> None:
+    """Delete a task directory directly under root; a link or a directory elsewhere is cleanup_failed."""
     try:
         # Check links before exists(): a dangling link must never look like successful cleanup.
         if directory.parent.resolve() != root.resolve() or directory.is_symlink() or directory.is_junction():
